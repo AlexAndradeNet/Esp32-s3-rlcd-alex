@@ -107,9 +107,10 @@ int rain_start_hour = -1, rain_stop_hour = -1;
 bool will_rain = false;
 char weather_label[24] = "Fair";
 
-// ---------- AUDIO RECORDING STATE ----------
+// ---------- AUDIO RECORDING STATE & SD WATCHDOG ----------
 uint8_t frame_buffer[AUDIO_FRAME_SIZE];
 bool isRecording = false;
+bool sdCardError = false; // Flagged if 0x107 or write failure occurs
 FILE *currentMeetingFile = NULL;
 char currentMeetingFileName[64] = "";
 uint32_t totalRecordedBytes = 0;
@@ -233,6 +234,8 @@ void loadSDConfigs() {
       }
       line = strtok(NULL, "\r\n");
     }
+  } else {
+    sdCardError = true;
   }
 
   memset(config_buffer, 0, sizeof(config_buffer));
@@ -257,7 +260,9 @@ void loadSDConfigs() {
 void cleanOldRecordings() {
   DIR *dir = opendir("/sdcard/meetings");
   if (!dir) {
-    mkdir("/sdcard/meetings", 0777);
+    if (mkdir("/sdcard/meetings", 0777) != 0) {
+      sdCardError = true;
+    }
     return;
   }
 
@@ -365,7 +370,6 @@ void drawClockCalendarScreen() {
   if (cur_year < 2000) cur_year = 2026;
   if (cur_day < 1 || cur_day > 31) cur_day = 1;
 
-  // 1. Time (HH:MM)
   char timeBuf[8];
   sprintf(timeBuf, "%02d:%02d", cur_hour, cur_min);
   canvas.setFont(&DSEG7_Classic_Bold_84);
@@ -373,7 +377,6 @@ void drawClockCalendarScreen() {
   canvas.setCursor(10, 85);
   canvas.print(timeBuf);
 
-  // Battery Indicator
   readBattery();
   int bX = 345, bY = 12;
   canvas.fillRect(bX, bY, 44, 22, 1);
@@ -385,7 +388,6 @@ void drawClockCalendarScreen() {
 
   canvas.fillRect(10, 95, 380, 2, 1);
 
-  // 2. Calendar Unit
   canvas.setFont(&FreeSansBold9pt7b);
   char dateHeader[32];
   sprintf(dateHeader, "%02d/%02d/%04d", cur_day, cur_mon, cur_year);
@@ -437,7 +439,6 @@ void drawClockCalendarScreen() {
 
   canvas.fillRect(182, 102, 2, 180, 1);
 
-  // 3. Weather Unit
   canvas.setTextColor(1);
   canvas.setFont(&FreeSansBold18pt7b);
   canvas.setCursor(195, 130);
@@ -508,11 +509,13 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 40, &dataSize, 4);
 }
 
-// Stream audio file from SD to Mac backend chunk-by-chunk (no RAM limits)
 void streamFileToBackend(const char* filepath) {
   if (WiFi.status() != WL_CONNECTED) return;
   FILE *f = fopen(filepath, "rb");
-  if (!f) return;
+  if (!f) {
+    sdCardError = true;
+    return;
+  }
 
   fseek(f, 0, SEEK_END);
   long fileSize = ftell(f);
@@ -573,12 +576,10 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
   canvas.fillScreen(0);
   canvas.setTextColor(1);
   
-  // Title
   canvas.setFont(&FreeSansBold12pt7b);
   canvas.setCursor(20, 45);
   canvas.print("Meeting Assistant");
 
-  // Status (Online / Offline)
   bool isOnline = (WiFi.status() == WL_CONNECTED);
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(20, 75);
@@ -588,17 +589,38 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
     canvas.print("Network: Offline (SD Card Only)");
   }
 
-  // Divider
   canvas.fillRect(20, 88, 360, 2, 1);
 
-  // Mandatory instruction label
+  // ---------- SD ERROR WARNING DIALOG ----------
+  if (sdCardError) {
+    canvas.fillRoundRect(20, 105, 360, 140, 6, 1);
+    canvas.setTextColor(0);
+    
+    canvas.setFont(&FreeSansBold12pt7b);
+    canvas.setCursor(35, 140);
+    canvas.print("SD Card Error!");
+
+    canvas.setFont(&FreeSansBold9pt7b);
+    canvas.setCursor(35, 175);
+    canvas.print("The SD card was not read or");
+    canvas.setCursor(35, 198);
+    canvas.print("timed out during operation.");
+    
+    canvas.setCursor(35, 230);
+    canvas.print("Please restart the device.");
+    
+    canvas.setTextColor(1);
+    pushCanvasToRLCD(false);
+    return;
+  }
+
+  // Mandatory instructions
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(20, 115);
-  canvas.print("Press the middle button");
+  canvas.print("Press the right button");
   canvas.setCursor(20, 135);
   canvas.print("to start and stop recording.");
 
-  // Recording Visualizer & Status
   if (isRecording) {
     canvas.drawCircle(40, 185, 14, 1);
     canvas.fillCircle(40, 185, 9, 1);
@@ -607,7 +629,6 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
     canvas.setCursor(65, 192);
     canvas.print("RECORDING...");
 
-    // Elapsed Timer (MM:SS)
     unsigned long elapsedSec = (millis() - recordingStartTime) / 1000;
     char timerBuf[16];
     sprintf(timerBuf, "%02lu:%02lu", elapsedSec / 60, elapsedSec % 60);
@@ -639,16 +660,27 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
 }
 
 void startMeetingRecording() {
+  if (sdCardError) return;
+
   sprintf(currentMeetingFileName, "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d.wav",
           rtc.getYear(), rtc.getMonth(), rtc.getDay(),
           rtc.getHour(), rtc.getMinute(), rtc.getSecond());
 
   currentMeetingFile = fopen(currentMeetingFileName, "wb");
-  if (!currentMeetingFile) return;
+  if (!currentMeetingFile) {
+    sdCardError = true;
+    drawMeetingAssistantUI();
+    return;
+  }
 
-  // Placeholder 44-byte WAV header
   uint8_t dummyHeader[44] = {0};
-  fwrite(dummyHeader, 1, 44, currentMeetingFile);
+  if (fwrite(dummyHeader, 1, 44, currentMeetingFile) < 44) {
+    sdCardError = true;
+    fclose(currentMeetingFile);
+    currentMeetingFile = NULL;
+    drawMeetingAssistantUI();
+    return;
+  }
 
   totalRecordedBytes = 0;
   recordingStartTime = millis();
@@ -661,13 +693,22 @@ void stopMeetingRecording() {
   isRecording = false;
 
   if (currentMeetingFile) {
-    // Rewind and write real WAV header
-    fseek(currentMeetingFile, 0, SEEK_SET);
-    uint8_t header[44];
-    writeWavHeader(header, totalRecordedBytes);
-    fwrite(header, 1, 44, currentMeetingFile);
+    if (fseek(currentMeetingFile, 0, SEEK_SET) != 0) {
+      sdCardError = true;
+    } else {
+      uint8_t header[44];
+      writeWavHeader(header, totalRecordedBytes);
+      if (fwrite(header, 1, 44, currentMeetingFile) < 44) {
+        sdCardError = true;
+      }
+    }
     fclose(currentMeetingFile);
     currentMeetingFile = NULL;
+  }
+
+  if (sdCardError) {
+    drawMeetingAssistantUI();
+    return;
   }
 
   bool isOnline = (WiFi.status() == WL_CONNECTED);
@@ -680,24 +721,51 @@ void stopMeetingRecording() {
   }
 }
 
-// ================= SCREEN 3: QR CONFIG WIZARD =================
-const uint8_t qr29[29][4] = {
-  {0xFF,0xFF,0xE0,0x00},{0x80,0x00,0x20,0x00},{0xBA,0xEE,0xA0,0x00},{0xBA,0xEE,0xA0,0x00},
-  {0xBA,0xEE,0xA0,0x00},{0x80,0x00,0x20,0x00},{0xFE,0xEE,0xE0,0x00},{0x00,0x00,0x00,0x00},
-  {0xEB,0x49,0xA0,0x00},{0x55,0x24,0x40,0x00},{0x2B,0x1F,0x60,0x00},{0x75,0x08,0x40,0x00},
-  {0xAB,0x67,0xA0,0x00},{0x00,0x00,0x00,0x00},{0xFE,0x08,0xE0,0x00},{0x80,0x7B,0x20,0x00},
-  {0xBA,0x34,0xA0,0x00},{0xBA,0x4F,0xA0,0x00},{0xBA,0x55,0xA0,0x00},{0x80,0x21,0x20,0x00},
-  {0xFE,0x7B,0xE0,0x00},{0x00,0x00,0x00,0x00},{0xAA,0xAA,0xA0,0x00},{0x55,0x55,0x40,0x00},
-  {0xBA,0xEF,0xA0,0x00},{0x80,0x00,0x20,0x00},{0xFE,0xEE,0xE0,0x00},{0x80,0x00,0x20,0x00},
-  {0xFF,0xFF,0xE0,0x00}
+// ================= SCREEN 3: VERIFIED QR CODE (33x33) =================
+// Encodes "WIFI:S:Intelligent-Clock;T:WPA;P:setup;;" with Quiet Zone
+const int QR_SIZE = 33;
+const uint8_t qr33[33][5] = {
+  {0x00, 0x00, 0x00, 0x00, 0x00},
+  {0x00, 0x00, 0x00, 0x00, 0x00},
+  {0x3F, 0x8A, 0xAE, 0xFE, 0x00},
+  {0x20, 0xA8, 0xDA, 0x82, 0x00},
+  {0x2E, 0x82, 0xE6, 0xBA, 0x00},
+  {0x2E, 0xBB, 0xF4, 0xBA, 0x00},
+  {0x2E, 0x90, 0xBE, 0xBA, 0x00},
+  {0x20, 0xB6, 0x78, 0x82, 0x00},
+  {0x3F, 0xAA, 0xAA, 0xFE, 0x00},
+  {0x00, 0x1C, 0x62, 0x00, 0x00},
+  {0x3E, 0xF5, 0x5D, 0x54, 0x00},
+  {0x25, 0x6B, 0xB7, 0xEC, 0x00},
+  {0x24, 0xA9, 0x7A, 0xB0, 0x00},
+  {0x32, 0x02, 0x85, 0x46, 0x00},
+  {0x01, 0x9B, 0x60, 0x18, 0x00},
+  {0x2E, 0x21, 0xA3, 0xEC, 0x00},
+  {0x1E, 0xA7, 0x43, 0xE8, 0x00},
+  {0x1D, 0x7C, 0x8A, 0x70, 0x00},
+  {0x0F, 0xAC, 0x3C, 0x16, 0x00},
+  {0x38, 0x5B, 0x15, 0xE4, 0x00},
+  {0x2F, 0xD1, 0xD8, 0x38, 0x00},
+  {0x2C, 0x7B, 0x4A, 0xE2, 0x00},
+  {0x34, 0xC2, 0xE3, 0xF8, 0x00},
+  {0x00, 0x30, 0x66, 0x28, 0x00},
+  {0x3F, 0xBE, 0x76, 0xA8, 0x00},
+  {0x20, 0x8C, 0x86, 0x34, 0x00},
+  {0x2E, 0xB4, 0x23, 0xE6, 0x00},
+  {0x2E, 0xBB, 0x82, 0x4E, 0x00},
+  {0x2E, 0xA9, 0xEF, 0xF4, 0x00},
+  {0x20, 0xAB, 0x4A, 0x14, 0x00},
+  {0x3F, 0xB2, 0xC4, 0x48, 0x00},
+  {0x00, 0x00, 0x00, 0x00, 0x00},
+  {0x00, 0x00, 0x00, 0x00, 0x00}
 };
 
 void drawQRCodeBitmap(int startX, int startY, int pixelScale) {
-  for (int y = 0; y < 29; y++) {
-    for (int x = 0; x < 29; x++) {
+  for (int y = 0; y < QR_SIZE; y++) {
+    for (int x = 0; x < QR_SIZE; x++) {
       int byteIdx = x / 8;
       int bitIdx = 7 - (x % 8);
-      bool isBlack = (qr29[y][byteIdx] & (1 << bitIdx)) != 0;
+      bool isBlack = (qr33[y][byteIdx] & (1 << bitIdx)) != 0;
       if (isBlack) {
         canvas.fillRect(startX + (x * pixelScale), startY + (y * pixelScale), pixelScale, pixelScale, 1);
       }
@@ -721,6 +789,8 @@ void queryIPGeolocation() {
     if (f) {
       fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\n", city_name, latitude, longitude, gmt_offset);
       fclose(f);
+    } else {
+      sdCardError = true;
     }
   }
   http.end();
@@ -748,9 +818,11 @@ void handleConfigServer() {
     if (f) {
       fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", req_ssid.c_str(), req_pass.c_str(), mac_server);
       fclose(f);
+    } else {
+      sdCardError = true;
     }
 
-    server.send(200, "text/html", "<html><body><h3>Credentials Saved! Rebooting Wi-Fi...</h3></body></html>");
+    server.send(200, "text/html", "<html><body><h3>Credentials Saved! Connecting...</h3></body></html>");
     delay(1000);
 
     WiFi.softAPdisconnect(true);
@@ -786,7 +858,11 @@ void startWiFiConfiguratorAP() {
   server.begin();
 
   canvas.fillScreen(0);
-  drawQRCodeBitmap(15, 45, 6);
+  
+  // Render verified 33x33 QR code at 5x pixel scale (165x165 px)
+  drawQRCodeBitmap(15, 60, 5);
+
+  canvas.fillRect(190, 30, 2, 240, 1); // Divider
 
   canvas.setTextColor(1);
   canvas.setFont(&FreeSansBold12pt7b);
@@ -815,7 +891,6 @@ void applyScreenPowerMode(AppScreen scr) {
       codecport->CodecPort_SetMicGain(35);
     }
   } else {
-    // If we were recording and swapped screens, abort cleanly
     if (isRecording) {
       stopMeetingRecording();
     }
@@ -838,7 +913,7 @@ void setup() {
   delay(200);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(RECORD_BUTTON_PIN, INPUT_PULLUP); // Middle / BOOT button
+  pinMode(RECORD_BUTTON_PIN, INPUT_PULLUP);
 
   analogReadResolution(12);
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
@@ -882,7 +957,7 @@ void loop() {
     previousScreen = currentScreen;
 
     // CONDITIONAL 3rd SCREEN:
-    // Only cycle into SCREEN_CONFIG if WiFi is disconnected!
+    // Only cycle into SCREEN_CONFIG if WiFi is disconnected
     if (currentScreen == SCREEN_CLOCK) {
       currentScreen = SCREEN_MEETING;
     } else if (currentScreen == SCREEN_MEETING) {
@@ -915,17 +990,25 @@ void loop() {
     }
     lastRecButtonState = recBtn;
 
-    // Continuous streaming to SD card while recording
+    // Stream audio frames to SD card with write-timeout protection
     if (isRecording) {
       if (codecport) {
         codecport->CodecPort_EchoRead(frame_buffer, AUDIO_FRAME_SIZE);
         if (currentMeetingFile) {
-          fwrite(frame_buffer, 1, AUDIO_FRAME_SIZE, currentMeetingFile);
-          totalRecordedBytes += AUDIO_FRAME_SIZE;
+          size_t written = fwrite(frame_buffer, 1, AUDIO_FRAME_SIZE, currentMeetingFile);
+          if (written < AUDIO_FRAME_SIZE || ferror(currentMeetingFile)) {
+            sdCardError = true;
+            isRecording = false;
+            fclose(currentMeetingFile);
+            currentMeetingFile = NULL;
+            drawMeetingAssistantUI();
+          } else {
+            totalRecordedBytes += written;
+          }
         }
       }
 
-      // Refresh timer on RLCD once per second
+      // Update timer on screen once per second
       if (millis() - lastTimerScreenUpdate >= 1000) {
         lastTimerScreenUpdate = millis();
         drawMeetingAssistantUI();
