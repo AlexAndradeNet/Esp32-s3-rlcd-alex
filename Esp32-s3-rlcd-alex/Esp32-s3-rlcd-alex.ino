@@ -5,6 +5,7 @@
 #include "esp_sleep.h"
 #include "font.h"
 #include "secfont.h"
+#include "qrcode.h"
 
 // Expose internal handle for SHTC3 ESP-IDF calls
 #include "driver/i2c_master.h"
@@ -37,8 +38,8 @@
 #define I2C_SDA            13
 #define I2C_SCL            14
 #define PA_CTRL            46
-#define BUTTON_PIN         18  // Screen cycle button
-#define RECORD_BUTTON_PIN  0   // Middle / BOOT button (Active-LOW)
+#define BUTTON_PIN         18  // Screen cycle button (Left)
+#define RECORD_BUTTON_PIN  0   // Record toggle button (Right / BOOT)
 #define BAT_ADC_PIN        4
 
 #define SAMPLE_RATE        16000
@@ -721,56 +722,31 @@ void stopMeetingRecording() {
   }
 }
 
-// ================= SCREEN 3: VERIFIED QR CODE (33x33) =================
-// Encodes "WIFI:S:Intelligent-Clock;T:WPA;P:setup;;" with Quiet Zone
-const int QR_SIZE = 33;
-const uint8_t qr33[33][5] = {
-  {0x00, 0x00, 0x00, 0x00, 0x00},
-  {0x00, 0x00, 0x00, 0x00, 0x00},
-  {0x3F, 0x8A, 0xAE, 0xFE, 0x00},
-  {0x20, 0xA8, 0xDA, 0x82, 0x00},
-  {0x2E, 0x82, 0xE6, 0xBA, 0x00},
-  {0x2E, 0xBB, 0xF4, 0xBA, 0x00},
-  {0x2E, 0x90, 0xBE, 0xBA, 0x00},
-  {0x20, 0xB6, 0x78, 0x82, 0x00},
-  {0x3F, 0xAA, 0xAA, 0xFE, 0x00},
-  {0x00, 0x1C, 0x62, 0x00, 0x00},
-  {0x3E, 0xF5, 0x5D, 0x54, 0x00},
-  {0x25, 0x6B, 0xB7, 0xEC, 0x00},
-  {0x24, 0xA9, 0x7A, 0xB0, 0x00},
-  {0x32, 0x02, 0x85, 0x46, 0x00},
-  {0x01, 0x9B, 0x60, 0x18, 0x00},
-  {0x2E, 0x21, 0xA3, 0xEC, 0x00},
-  {0x1E, 0xA7, 0x43, 0xE8, 0x00},
-  {0x1D, 0x7C, 0x8A, 0x70, 0x00},
-  {0x0F, 0xAC, 0x3C, 0x16, 0x00},
-  {0x38, 0x5B, 0x15, 0xE4, 0x00},
-  {0x2F, 0xD1, 0xD8, 0x38, 0x00},
-  {0x2C, 0x7B, 0x4A, 0xE2, 0x00},
-  {0x34, 0xC2, 0xE3, 0xF8, 0x00},
-  {0x00, 0x30, 0x66, 0x28, 0x00},
-  {0x3F, 0xBE, 0x76, 0xA8, 0x00},
-  {0x20, 0x8C, 0x86, 0x34, 0x00},
-  {0x2E, 0xB4, 0x23, 0xE6, 0x00},
-  {0x2E, 0xBB, 0x82, 0x4E, 0x00},
-  {0x2E, 0xA9, 0xEF, 0xF4, 0x00},
-  {0x20, 0xAB, 0x4A, 0x14, 0x00},
-  {0x3F, 0xB2, 0xC4, 0x48, 0x00},
-  {0x00, 0x00, 0x00, 0x00, 0x00},
-  {0x00, 0x00, 0x00, 0x00, 0x00}
-};
+// ================= DYNAMIC QR CODE GENERATOR (NATIVE ESP-IDF) =================
+static void qrcode_canvas_draw(esp_qrcode_handle_t qrcode) {
+  int size = esp_qrcode_get_size(qrcode);
+  int maxPixelSize = 155;
+  int scale = maxPixelSize / size;
+  if (scale < 1) scale = 1;
+  int qrWidth = size * scale;
+  int startX = (190 - qrWidth) / 2;
+  int startY = 60;
 
-void drawQRCodeBitmap(int startX, int startY, int pixelScale) {
-  for (int y = 0; y < QR_SIZE; y++) {
-    for (int x = 0; x < QR_SIZE; x++) {
-      int byteIdx = x / 8;
-      int bitIdx = 7 - (x % 8);
-      bool isBlack = (qr33[y][byteIdx] & (1 << bitIdx)) != 0;
-      if (isBlack) {
-        canvas.fillRect(startX + (x * pixelScale), startY + (y * pixelScale), pixelScale, pixelScale, 1);
+  for (int y = 0; y < size; y++) {
+    for (int x = 0; x < size; x++) {
+      if (esp_qrcode_get_module(qrcode, x, y)) {
+        canvas.fillRect(startX + (x * scale), startY + (y * scale), scale, scale, 1);
       }
     }
   }
+}
+
+void drawDynamicQRCode(const char* text) {
+  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+  cfg.display_func = qrcode_canvas_draw;
+  cfg.max_qrcode_version = 5;
+  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  esp_qrcode_generate(&cfg, text);
 }
 
 void queryIPGeolocation() {
@@ -846,37 +822,59 @@ void handleConfigServer() {
   });
 }
 
+// ================= SCREEN 3: DYNAMIC PASSWORDLESS QR CONFIG =================
 void startWiFiConfiguratorAP() {
   IPAddress apIP(192, 168, 5, 1);
   IPAddress netMsk(255, 255, 255, 0);
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, netMsk);
-  WiFi.softAP("Intelligent-Clock", "setup");
-
+  
   dnsServer.start(53, "*", apIP);
   handleConfigServer();
   server.begin();
 
+  // Read the active SoftAP SSID
+  String defaultSSID = WiFi.softAPSSID();
+  if (defaultSSID.length() == 0) {
+    defaultSSID = "Intelligent-Clock";
+  }
+
+  // Standard open/passwordless Wi-Fi QR format
+  String qrPayload = "WIFI:S:" + defaultSSID + ";T:nopass;;";
+
   canvas.fillScreen(0);
   
-  // Render verified 33x33 QR code at 5x pixel scale (165x165 px)
-  drawQRCodeBitmap(15, 60, 5);
+  // Dynamically generated QR code
+  drawDynamicQRCode(qrPayload.c_str());
 
-  canvas.fillRect(190, 30, 2, 240, 1); // Divider
+  canvas.fillRect(190, 30, 2, 240, 1);
 
   canvas.setTextColor(1);
   canvas.setFont(&FreeSansBold12pt7b);
-  canvas.setCursor(205, 50);
+  canvas.setCursor(205, 45);
   canvas.print("WiFi Setup");
 
   canvas.setFont(&FreeSansBold9pt7b);
-  canvas.setCursor(205, 80);  canvas.print("1. Scan QR Code");
-  canvas.setCursor(205, 105); canvas.print("   Or connect to:");
-  canvas.setCursor(205, 125); canvas.print("   Intelligent-Clock");
-  canvas.setCursor(205, 145); canvas.print("   Pass: setup");
-  canvas.setCursor(205, 175); canvas.print("2. Open browser at:");
-  canvas.setCursor(205, 195); canvas.print("   192.168.5.1");
-  canvas.setCursor(205, 225); canvas.print("3. Follow Wizard");
+  canvas.setCursor(205, 75);  
+  canvas.print("1. Scan QR Code");
+
+  canvas.setCursor(205, 100); 
+  canvas.print("   Network (SSID):");
+  
+  canvas.setCursor(205, 120); 
+  canvas.print("   " + defaultSSID);
+
+  canvas.setCursor(205, 142); 
+  canvas.print("   (Passwordless)");
+
+  canvas.setCursor(205, 172); 
+  canvas.print("2. Open browser at:");
+
+  canvas.setCursor(205, 192); 
+  canvas.print("   http://192.168.5.1");
+
+  canvas.setCursor(205, 225); 
+  canvas.print("3. Follow Wizard");
 
   pushCanvasToRLCD(false);
 }
@@ -950,7 +948,7 @@ void setup() {
 }
 
 void loop() {
-  // 1. Debounced Screen Switching Button (GPIO 18)
+  // 1. Screen Switching Button (GPIO 18 - Left)
   bool reading = digitalRead(BUTTON_PIN);
   if (reading == LOW && lastButtonState == HIGH && (millis() - lastButtonPress > debounceTime)) {
     lastButtonPress = millis();
@@ -977,7 +975,7 @@ void loop() {
   }
   lastButtonState = reading;
 
-  // 2. Middle Button (GPIO 0) for Recording Toggle
+  // 2. Right Button (GPIO 0 - BOOT) for Recording Toggle
   if (currentScreen == SCREEN_MEETING) {
     bool recBtn = digitalRead(RECORD_BUTTON_PIN);
     if (recBtn == LOW && lastRecButtonState == HIGH && (millis() - lastRecButtonPress > 350)) {
