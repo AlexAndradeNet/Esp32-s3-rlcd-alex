@@ -376,10 +376,11 @@ void updateOpenMeteo() {
 
     will_rain = (rain_prob_max > 30 || precip_sum > 0.5f);
 
-    if (weather_code == 0) strcpy(weather_label, "Clear");
+    if (weather_code <= 1) strcpy(weather_label, "Clear");
     else if (weather_code <= 3) strcpy(weather_label, "Cloudy");
     else if (weather_code <= 48) strcpy(weather_label, "Foggy");
-    else if (weather_code <= 67) strcpy(weather_label, "Rainy");
+    else if (weather_code <= 67 || (weather_code >= 80 && weather_code <= 82)) strcpy(weather_label, "Rainy");
+    else if ((weather_code >= 71 && weather_code <= 77) || weather_code == 85 || weather_code == 86) strcpy(weather_label, "Snow");
     else if (weather_code >= 95) strcpy(weather_label, "Storm");
     else strcpy(weather_label, "Fair");
 
