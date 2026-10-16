@@ -357,7 +357,36 @@ void cleanOldRecordings() {
   closedir(dir);
 }
 
-// ================= NETWORK & NTP =================
+// ================= GEOLOCATION, NTP & WEATHER =================
+void queryIPGeolocation() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin("http://ip-api.com/json/");
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, http.getString());
+    strncpy(city_name, doc["city"] | "Medellin", sizeof(city_name) - 1);
+    
+    float latVal = doc["lat"] | 6.2442f;
+    float lonVal = doc["lon"] | -75.5812f;
+    dtostrf(latVal, 6, 4, latitude);
+    dtostrf(lonVal, 6, 4, longitude);
+
+    int offsetSec = doc["offset"] | -18000;
+    gmt_offset = offsetSec / 3600;
+
+    FILE *f = fopen("/sdcard/config_clock.txt", "w");
+    if (f) {
+      fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\n", city_name, latitude, longitude, gmt_offset);
+      fclose(f);
+    } else {
+      sdCardError = true;
+    }
+  }
+  http.end();
+}
+
 bool syncNTP() {
   configTime(gmt_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
   struct tm ti;
@@ -525,40 +554,45 @@ void drawClockCalendarScreen() {
 
   // Weather Unit
   canvas.setTextColor(1);
+  canvas.setFont(&FreeSansBold9pt7b);
+  canvas.setCursor(195, 114);
+  canvas.print(city_name);
+
   canvas.setFont(&FreeSansBold18pt7b);
-  canvas.setCursor(195, 130);
+  canvas.setCursor(195, 150);
   canvas.printf("%dC", cur_temp);
 
   canvas.setFont(&FreeSansBold9pt7b);
-  canvas.setCursor(265, 130);
+  canvas.setCursor(265, 150);
   canvas.printf("%s", weather_label);
 
-  canvas.setCursor(195, 150);
+  canvas.setCursor(195, 168);
   canvas.printf("Min/Max: %d / %dC", min_temp, max_temp);
 
-  canvas.setCursor(195, 168);
+  canvas.setCursor(195, 186);
   canvas.printf("Feels: %dC | Hum: %d%%", feels_like, cur_humidity);
 
-  canvas.setCursor(195, 186);
+  canvas.setCursor(195, 204);
   canvas.printf("Rain?: %s (%d%%)", will_rain ? "Yes" : "No", rain_prob_max);
 
   if (rain_start_hour != -1) {
-    canvas.setCursor(195, 204);
+    canvas.setCursor(195, 222);
     canvas.printf("Rain: %02d:00-%02d:00", rain_start_hour, rain_stop_hour);
   } else {
-    canvas.setCursor(195, 204);
+    canvas.setCursor(195, 222);
     canvas.printf("Rain: None expected");
   }
 
-  canvas.setCursor(195, 222);
+  canvas.setCursor(195, 240);
   canvas.printf("Precip Sum: %.1f mm", precip_sum);
 
   shtc3_read_i2cbus(temp_shtc3, hum_shtc3);
-  canvas.setCursor(195, 245);
+  canvas.setCursor(195, 262);
   canvas.printf("Local: %dC | %d%% RH", (int)round(temp_shtc3), (int)round(hum_shtc3));
 
-  // Footer: Cached IP address displayed even with Wi-Fi powered down
-  canvas.setCursor(195, 285);
+  // Footer: Cached IP address displayed in bottom-left corner
+  canvas.setFont(&FreeSansBold9pt7b);
+  canvas.setCursor(10, 285);
   canvas.print(lastKnownIP);
 
   pushCanvasToRLCD(false);
@@ -835,29 +869,6 @@ void drawDynamicQRCode(const char* text) {
   esp_qrcode_generate(&cfg, text);
 }
 
-void queryIPGeolocation() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  http.begin("http://ip-api.com/json/");
-  if (http.GET() == 200) {
-    DynamicJsonDocument doc(2048);
-    deserializeJson(doc, http.getString());
-    strncpy(city_name, doc["city"] | "Medellin", sizeof(city_name) - 1);
-    dtostrf(doc["lat"] | 6.2442, 6, 4, latitude);
-    dtostrf(doc["lon"] | -75.5812, 6, 4, longitude);
-    gmt_offset = (doc["offset"] | -18000) / 3600;
-
-    FILE *f = fopen("/sdcard/config_clock.txt", "w");
-    if (f) {
-      fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\n", city_name, latitude, longitude, gmt_offset);
-      fclose(f);
-    } else {
-      sdCardError = true;
-    }
-  }
-  http.end();
-}
-
 void handleConfigServer() {
   server.on("/", HTTP_GET, []() {
     int n = WiFi.scanNetworks();
@@ -924,7 +935,7 @@ void startWiFiConfiguratorAP() {
   IPAddress netMsk(255, 255, 255, 0);
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, netMsk);
-  
+
   dnsServer.start(53, "*", apIP);
   handleConfigServer();
   server.begin();
@@ -1032,6 +1043,7 @@ void setup() {
   // Enable Wi-Fi during boot
   bool connected = ensureWiFiConnected(8);
   if (connected) {
+    queryIPGeolocation();
     syncNTP();
     updateOpenMeteo();
     lastWeatherSync = millis();
@@ -1128,14 +1140,15 @@ void loop() {
     static unsigned long lastRtcRead = 0;
     unsigned long now = millis();
 
-    // 15-minute sync query (Enable Wi-Fi for weather update, then disable)
+    // 15-minute sync query: Wakes Wi-Fi, queries IP-API -> syncs NTP -> updates OpenMeteo -> disables Wi-Fi
     if (now - lastWeatherSync >= WEATHER_SYNC_INTERVAL) {
       lastWeatherSync = now;
       setLowPowerClock(false); // Boost clock for network operations
       if (ensureWiFiConnected(6)) {
+        queryIPGeolocation();
         syncNTP();
         updateOpenMeteo();
-        disableWiFi(); // Power down Wi-Fi immediately after weather sync
+        disableWiFi(); // Power down Wi-Fi immediately after sync sequence
       } else {
         disableWiFi();
       }
