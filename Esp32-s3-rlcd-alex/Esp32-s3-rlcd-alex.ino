@@ -491,12 +491,12 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 8, "WAVEfmt ", 8);
 
   uint32_t subChunk1Size = 16;
-  uint16_t audioFormat = 1;
-  uint16_t numChannels = CHANNELS;
-  uint32_t sampleRate = SAMPLE_RATE;
-  uint32_t byteRate = sampleRate * CHANNELS * 2;
-  uint16_t blockAlign = CHANNELS * 2;
-  uint16_t bitsPerSample = 16;
+  uint16_t audioFormat = 1;                      // 1 = WAVE_FORMAT_PCM (Uncompressed 16-bit)
+  uint16_t numChannels = CHANNELS;               // 1 (Mono)
+  uint32_t sampleRate = SAMPLE_RATE;             // 16000 Hz
+  uint32_t byteRate = sampleRate * CHANNELS * 2; // 32000 bytes/sec
+  uint16_t blockAlign = CHANNELS * 2;            // 2 bytes per sample
+  uint16_t bitsPerSample = 16;                   // 16-bit PCM
 
   memcpy(buffer + 16, &subChunk1Size, 4);
   memcpy(buffer + 20, &audioFormat, 2);
@@ -988,10 +988,11 @@ void loop() {
     }
     lastRecButtonState = recBtn;
 
-    // Stream audio frames to SD card with write-timeout protection
+    // Stream uncompressed 16-bit PCM frames to SD card
     if (isRecording) {
       if (codecport) {
         codecport->CodecPort_EchoRead(frame_buffer, AUDIO_FRAME_SIZE);
+
         if (currentMeetingFile) {
           size_t written = fwrite(frame_buffer, 1, AUDIO_FRAME_SIZE, currentMeetingFile);
           if (written < AUDIO_FRAME_SIZE || ferror(currentMeetingFile)) {
