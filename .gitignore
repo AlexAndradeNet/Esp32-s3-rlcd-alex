@@ -115,3 +115,7 @@ DerivedData/
 # Playgrounds
 timeline.xctimeline
 playground.xcworkspace
+
+# Project
+config_clock.txt
+config_wifi.txt

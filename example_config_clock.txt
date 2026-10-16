@@ -1,0 +1,4 @@
+city=Medellín
+latitude=6.2529
+longitude=-75.5646
+gmt=-5

@@ -1,0 +1,3 @@
+wifi_ssid=
+wifi_pass=
+mac_server=http://192.168.1.100:5000
