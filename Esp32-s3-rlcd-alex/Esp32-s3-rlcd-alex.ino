@@ -95,6 +95,10 @@ char latitude[16] = "6.2442";
 char longitude[16] = "-75.5812";
 int gmt_offset = -5;
 
+// Network State Cache (Displayed while Wi-Fi radio is powered off)
+String lastKnownIP = "No Wi-Fi";
+bool lastNetworkAvailable = false;
+
 // ---------- SENSOR & BATTERY VALUES ----------
 float temp_shtc3 = 0.0, hum_shtc3 = 0.0;
 float v_bat = 0.0;
@@ -122,6 +126,42 @@ unsigned long lastTimerScreenUpdate = 0;
 const int daysPerMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 bool isLeapYear(int yr) {
   return ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0));
+}
+
+// ================= POWER-SAVING WI-FI MANAGERS =================
+bool ensureWiFiConnected(int maxWaitSec = 6) {
+  if (WiFi.status() == WL_CONNECTED) {
+    lastKnownIP = WiFi.localIP().toString();
+    lastNetworkAvailable = true;
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_pass);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < (maxWaitSec * 2)) {
+    delay(500);
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lastKnownIP = WiFi.localIP().toString();
+    lastNetworkAvailable = true;
+    return true;
+  } else {
+    lastKnownIP = "No Wi-Fi";
+    lastNetworkAvailable = false;
+    return false;
+  }
+}
+
+void disableWiFi() {
+  // Never turn off Wi-Fi if the user is in Screen 3 (AP configuration mode)
+  if (currentScreen != SCREEN_CONFIG) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
 }
 
 // ================= BATTERY LOGIC =================
@@ -473,17 +513,14 @@ void drawClockCalendarScreen() {
   canvas.setCursor(195, 245);
   canvas.printf("Local: %dC | %d%% RH", (int)round(temp_shtc3), (int)round(hum_shtc3));
 
+  // Footer: Cached IP address displayed even with Wi-Fi powered down
   canvas.setCursor(195, 285);
-  if (WiFi.status() == WL_CONNECTED) {
-    canvas.print(WiFi.localIP().toString());
-  } else {
-    canvas.print("No Wi-Fi");
-  }
+  canvas.print(lastKnownIP);
 
   pushCanvasToRLCD(false);
 }
 
-// ================= SCREEN 2: MEETING ASSISTANT =================
+// ================= SCREEN 2: MEETING ASSISTANT (16-BIT PCM WAV) =================
 void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer, "RIFF", 4);
   uint32_t chunkSize = dataSize + 36;
@@ -491,7 +528,7 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 8, "WAVEfmt ", 8);
 
   uint32_t subChunk1Size = 16;
-  uint16_t audioFormat = 1;                      // 1 = WAVE_FORMAT_PCM (Uncompressed 16-bit)
+  uint16_t audioFormat = 1;                      // 1 = WAVE_FORMAT_PCM (Uncompressed 16-bit linear)
   uint16_t numChannels = CHANNELS;               // 1 (Mono)
   uint32_t sampleRate = SAMPLE_RATE;             // 16000 Hz
   uint32_t byteRate = sampleRate * CHANNELS * 2; // 32000 bytes/sec
@@ -581,11 +618,10 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
   canvas.setCursor(20, 45);
   canvas.print("Meeting Assistant");
 
-  bool isOnline = (WiFi.status() == WL_CONNECTED);
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(20, 75);
-  if (isOnline) {
-    canvas.print("Network: Online (Cloud Sync)");
+  if (lastNetworkAvailable) {
+    canvas.print("Network: Ready (Cloud Sync)");
   } else {
     canvas.print("Network: Offline (SD Card Only)");
   }
@@ -712,13 +748,18 @@ void stopMeetingRecording() {
     return;
   }
 
-  bool isOnline = (WiFi.status() == WL_CONNECTED);
-  if (isOnline) {
+  // Enable Wi-Fi exclusively for audio transmission
+  drawMeetingAssistantUI("Connecting Wi-Fi...");
+  bool connected = ensureWiFiConnected(6);
+
+  if (connected) {
     drawMeetingAssistantUI("Syncing to Mac...");
     streamFileToBackend(currentMeetingFileName);
     drawMeetingAssistantUI("Saved & Transmitted!");
+    disableWiFi(); // Immediately shut down Wi-Fi after transmission
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
+    disableWiFi();
   }
 }
 
@@ -815,6 +856,13 @@ void handleConfigServer() {
       queryIPGeolocation();
       syncNTP();
       updateOpenMeteo();
+      lastKnownIP = WiFi.localIP().toString();
+      lastNetworkAvailable = true;
+      disableWiFi();
+    } else {
+      lastKnownIP = "No Wi-Fi";
+      lastNetworkAvailable = false;
+      disableWiFi();
     }
 
     currentScreen = SCREEN_CLOCK;
@@ -901,8 +949,7 @@ void applyScreenPowerMode(AppScreen scr) {
     server.close();
     dnsServer.stop();
     WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifi_ssid, wifi_pass);
+    disableWiFi();
   }
 }
 
@@ -929,18 +976,15 @@ void setup() {
   loadSDConfigs();
   cleanOldRecordings();
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_pass);
-  int wRetries = 0;
-  while (WiFi.status() != WL_CONNECTED && wRetries < 15) {
-    delay(400);
-    wRetries++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
+  // Enable Wi-Fi during boot
+  bool connected = ensureWiFiConnected(8);
+  if (connected) {
     syncNTP();
     updateOpenMeteo();
     lastWeatherSync = millis();
+    disableWiFi(); // Power down Wi-Fi immediately after initial boot sync
+  } else {
+    disableWiFi();
   }
 
   drawClockCalendarScreen();
@@ -954,12 +998,13 @@ void loop() {
     lastButtonPress = millis();
     previousScreen = currentScreen;
 
-    // CONDITIONAL 3rd SCREEN:
-    // Only cycle into SCREEN_CONFIG if WiFi is disconnected
+    // Enable Wi-Fi during screen cycling to verify network status
+    bool isOnline = ensureWiFiConnected(4);
+
     if (currentScreen == SCREEN_CLOCK) {
       currentScreen = SCREEN_MEETING;
     } else if (currentScreen == SCREEN_MEETING) {
-      if (WiFi.status() == WL_CONNECTED) {
+      if (isOnline) {
         currentScreen = SCREEN_CLOCK;
       } else {
         currentScreen = SCREEN_CONFIG;
@@ -970,8 +1015,13 @@ void loop() {
 
     applyScreenPowerMode(currentScreen);
 
-    if (currentScreen == SCREEN_CLOCK) drawClockCalendarScreen();
-    else if (currentScreen == SCREEN_MEETING) drawMeetingAssistantUI();
+    if (currentScreen == SCREEN_CLOCK) {
+      drawClockCalendarScreen();
+      disableWiFi(); // Disable Wi-Fi after rendering Clock Screen
+    } else if (currentScreen == SCREEN_MEETING) {
+      drawMeetingAssistantUI();
+      disableWiFi(); // Disable Wi-Fi while idle/recording in Meeting Screen
+    }
   }
   lastButtonState = reading;
 
@@ -988,7 +1038,7 @@ void loop() {
     }
     lastRecButtonState = recBtn;
 
-    // Stream uncompressed 16-bit PCM frames to SD card
+    // Stream uncompressed 16-bit linear PCM frames to SD card
     if (isRecording) {
       if (codecport) {
         codecport->CodecPort_EchoRead(frame_buffer, AUDIO_FRAME_SIZE);
@@ -1023,20 +1073,15 @@ void loop() {
     int curMin = rtc.getMinute();
     unsigned long now = millis();
 
-    // 15-minute sync query
+    // 15-minute sync query (Enable Wi-Fi for weather update, then disable)
     if (now - lastWeatherSync >= WEATHER_SYNC_INTERVAL) {
       lastWeatherSync = now;
-      if (WiFi.status() != WL_CONNECTED) {
-        WiFi.begin(wifi_ssid, wifi_pass);
-        int r = 0;
-        while (WiFi.status() != WL_CONNECTED && r < 10) {
-          delay(300);
-          r++;
-        }
-      }
-      if (WiFi.status() == WL_CONNECTED) {
+      if (ensureWiFiConnected(6)) {
         syncNTP();
         updateOpenMeteo();
+        disableWiFi(); // Power down Wi-Fi immediately after weather sync
+      } else {
+        disableWiFi();
       }
       drawClockCalendarScreen();
       lastDrawnMinute = curMin;
