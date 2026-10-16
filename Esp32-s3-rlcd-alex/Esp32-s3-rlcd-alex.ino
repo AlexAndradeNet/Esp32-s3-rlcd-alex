@@ -128,8 +128,21 @@ bool isLeapYear(int yr) {
   return ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0));
 }
 
+// ================= DYNAMIC CPU POWER SCALING =================
+void setLowPowerClock(bool lowPower) {
+  if (lowPower) {
+    // 80 MHz preserves bus stability while cutting base CPU current by ~60%
+    setCpuFrequencyMhz(80);
+  } else {
+    // Boost clock for Wi-Fi, DNS/Web server, and audio capture
+    setCpuFrequencyMhz(160);
+  }
+}
+
 // ================= POWER-SAVING WI-FI MANAGERS =================
 bool ensureWiFiConnected(int maxWaitSec = 6) {
+  setLowPowerClock(false);
+
   if (WiFi.status() == WL_CONNECTED) {
     lastKnownIP = WiFi.localIP().toString();
     lastNetworkAvailable = true;
@@ -762,6 +775,7 @@ void stopMeetingRecording() {
 
   // Enable Wi-Fi exclusively for audio transmission
   drawMeetingAssistantUI("Connecting Wi-Fi...");
+  setLowPowerClock(false); // Boost CPU for high-speed transmission
   bool connected = ensureWiFiConnected(6);
 
   if (connected) {
@@ -879,11 +893,14 @@ void handleConfigServer() {
 
     currentScreen = SCREEN_CLOCK;
     drawClockCalendarScreen();
+    setLowPowerClock(true);
   });
 }
 
 // ================= SCREEN 3: DYNAMIC PASSWORDLESS QR CONFIG =================
 void startWiFiConfiguratorAP() {
+  setLowPowerClock(false); // Boost CPU for handling DNS and Web server requests
+
   IPAddress apIP(192, 168, 5, 1);
   IPAddress netMsk(255, 255, 255, 0);
   WiFi.mode(WIFI_AP);
@@ -942,6 +959,7 @@ void startWiFiConfiguratorAP() {
 // ================= POWER & DISPATCH =================
 void applyScreenPowerMode(AppScreen scr) {
   if (scr == SCREEN_MEETING) {
+    setLowPowerClock(false); // Boost CPU for 16 kHz I2S audio reading
     digitalWrite(PA_CTRL, HIGH);
     if (!codecport) {
       codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
@@ -962,6 +980,10 @@ void applyScreenPowerMode(AppScreen scr) {
     dnsServer.stop();
     WiFi.softAPdisconnect(true);
     disableWiFi();
+  }
+
+  if (scr == SCREEN_CLOCK) {
+    setLowPowerClock(true); // Return to 80 MHz low-power mode
   }
 }
 
@@ -1001,6 +1023,7 @@ void setup() {
 
   drawClockCalendarScreen();
   lastDrawnMinute = rtc.getMinute();
+  setLowPowerClock(true); // Drop clock speed to 80 MHz for power conservation
 }
 
 void loop() {
@@ -1030,6 +1053,7 @@ void loop() {
     if (currentScreen == SCREEN_CLOCK) {
       drawClockCalendarScreen();
       disableWiFi(); // Disable Wi-Fi after rendering Clock Screen
+      setLowPowerClock(true);
     } else if (currentScreen == SCREEN_MEETING) {
       drawMeetingAssistantUI();
       disableWiFi(); // Disable Wi-Fi while idle/recording in Meeting Screen
@@ -1082,12 +1106,13 @@ void loop() {
     dnsServer.processNextRequest();
     server.handleClient();
   } else if (currentScreen == SCREEN_CLOCK) {
-    int curMin = rtc.getMinute();
+    static unsigned long lastRtcRead = 0;
     unsigned long now = millis();
 
     // 15-minute sync query (Enable Wi-Fi for weather update, then disable)
     if (now - lastWeatherSync >= WEATHER_SYNC_INTERVAL) {
       lastWeatherSync = now;
+      setLowPowerClock(false); // Boost clock for network operations
       if (ensureWiFiConnected(6)) {
         syncNTP();
         updateOpenMeteo();
@@ -1095,15 +1120,25 @@ void loop() {
       } else {
         disableWiFi();
       }
+      setLowPowerClock(true); // Return to 80 MHz low-power clock
       drawClockCalendarScreen();
-      lastDrawnMinute = curMin;
+      lastDrawnMinute = rtc.getMinute();
     } 
-    // Minute tick update
-    else if (curMin != lastDrawnMinute) {
-      lastDrawnMinute = curMin;
-      drawClockCalendarScreen();
+    // Check RTC only ONCE per second (1 Hz) instead of every single loop pass
+    else if (now - lastRtcRead >= 1000) {
+      lastRtcRead = now;
+      int curMin = rtc.getMinute();
+      if (curMin != lastDrawnMinute) {
+        lastDrawnMinute = curMin;
+        drawClockCalendarScreen();
+      }
     }
   }
 
-  delay(20);
+  // Adaptive delay: 100ms idle delay on Clock Screen saves CPU cycles, 20ms elsewhere
+  if (currentScreen == SCREEN_CLOCK && !isRecording) {
+    delay(100);
+  } else {
+    delay(20);
+  }
 }
