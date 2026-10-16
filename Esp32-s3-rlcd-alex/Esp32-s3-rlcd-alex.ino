@@ -184,6 +184,15 @@ void readBattery() {
   v_bat = v_adc * 3.0f * 1.079f;
 }
 
+int getBatteryPercentage(float vbat) {
+  if (vbat >= 4.15f) return 100;
+  if (vbat <= 3.40f) return 0;
+  int pct = (int)roundf((vbat - 3.40f) / (4.15f - 3.40f) * 100.0f);
+  if (pct > 100) pct = 100;
+  if (pct < 0) pct = 0;
+  return pct;
+}
+
 int getBatteryBars(float vbat) {
   if (vbat >= 4.00) return 5;
   if (vbat >= 3.90) return 4;
@@ -432,14 +441,24 @@ void drawClockCalendarScreen() {
   canvas.setCursor(10, 85);
   canvas.print(timeBuf);
 
+  // Battery Indicator (Centered percentage number inside icon, no '%' symbol)
   readBattery();
-  int bX = 345, bY = 12;
-  canvas.fillRect(bX, bY, 44, 22, 1);
-  canvas.fillRect(bX + 3, bY + 3, 38, 16, 0);
-  canvas.fillRect(bX + 44, bY + 6, 4, 10, 1);
-  for (int i = 0; i < getBatteryBars(v_bat); i++) {
-    canvas.fillRect(bX + 5 + (i * 7), bY + 5, 5, 12, 1);
-  }
+  int bX = 343, bY = 12;
+  canvas.fillRect(bX, bY, 46, 22, 1);
+  canvas.fillRect(bX + 3, bY + 3, 40, 16, 0);
+  canvas.fillRect(bX + 46, bY + 6, 4, 10, 1);
+
+  char batStr[8];
+  sprintf(batStr, "%d", getBatteryPercentage(v_bat));
+  canvas.setFont(&FreeSansBold9pt7b);
+  canvas.setTextColor(1);
+  int16_t bx1, by1;
+  uint16_t bw, bh;
+  canvas.getTextBounds(batStr, 0, 0, &bx1, &by1, &bw, &bh);
+  int textX = (bX + 3) + (40 - (int)bw) / 2 - bx1;
+  int textY = (bY + 3) + (16 - (int)bh) / 2 - by1;
+  canvas.setCursor(textX, textY);
+  canvas.print(batStr);
 
   canvas.fillRect(10, 95, 380, 2, 1);
 
