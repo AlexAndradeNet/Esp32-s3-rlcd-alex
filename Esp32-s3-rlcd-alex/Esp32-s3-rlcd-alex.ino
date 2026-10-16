@@ -90,9 +90,9 @@ char config_buffer[2048] = {0};
 char wifi_ssid[64] = "";
 char wifi_pass[64] = "";
 char mac_server[128] = "http://192.168.1.100:5000";
-char city_name[32] = "Medellin";
-char latitude[16] = "6.2442";
-char longitude[16] = "-75.5812";
+char city_name[32] = "Bogota";
+char latitude[16] = "4.7110";
+char longitude[16] = "-74.0721";
 int gmt_offset = -5;
 
 // Network State Cache (Displayed while Wi-Fi radio is powered off)
@@ -366,14 +366,21 @@ void queryIPGeolocation() {
   if (httpCode == 200) {
     DynamicJsonDocument doc(2048);
     deserializeJson(doc, http.getString());
-    strncpy(city_name, doc["city"] | "Medellin", sizeof(city_name) - 1);
     
-    float latVal = doc["lat"] | 6.2442f;
-    float lonVal = doc["lon"] | -75.5812f;
+    // Reuse variables defined at the top as defaults if keys are missing
+    if (doc.containsKey("city") && !doc["city"].isNull()) {
+      strncpy(city_name, doc["city"], sizeof(city_name) - 1);
+    }
+    
+    float defaultLat = (float)atof(latitude);
+    float defaultLon = (float)atof(longitude);
+    float latVal = doc["lat"] | defaultLat;
+    float lonVal = doc["lon"] | defaultLon;
     dtostrf(latVal, 6, 4, latitude);
     dtostrf(lonVal, 6, 4, longitude);
 
-    int offsetSec = doc["offset"] | -18000;
+    int defaultOffset = gmt_offset * 3600;
+    int offsetSec = doc["offset"] | defaultOffset;
     gmt_offset = offsetSec / 3600;
 
     FILE *f = fopen("/sdcard/config_clock.txt", "w");
@@ -606,12 +613,12 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 8, "WAVEfmt ", 8);
 
   uint32_t subChunk1Size = 16;
-  uint16_t audioFormat = 1;                      // 1 = WAVE_FORMAT_PCM (Uncompressed 16-bit linear)
-  uint16_t numChannels = CHANNELS;               // 1 (Mono)
-  uint32_t sampleRate = SAMPLE_RATE;             // 16000 Hz
-  uint32_t byteRate = sampleRate * CHANNELS * 2; // 32000 bytes/sec
-  uint16_t blockAlign = CHANNELS * 2;            // 2 bytes per sample
-  uint16_t bitsPerSample = 16;                   // 16-bit PCM
+  uint16_t audioFormat = 1;                                      // 1 = WAVE_FORMAT_PCM (Uncompressed 16-bit linear)
+  uint16_t numChannels = CHANNELS;                               // 1 (Mono)
+  uint32_t sampleRate = SAMPLE_RATE;                             // 16000 Hz
+  uint16_t blockAlign = CHANNELS * (BITS_PER_SAMPLE / 8);        // 2 bytes per sample
+  uint32_t byteRate = sampleRate * blockAlign;                   // 32000 bytes/sec
+  uint16_t bitsPerSample = BITS_PER_SAMPLE;                      // 16-bit PCM
 
   memcpy(buffer + 16, &subChunk1Size, 4);
   memcpy(buffer + 20, &audioFormat, 2);
@@ -887,9 +894,12 @@ void handleConfigServer() {
     String req_ssid = server.arg("ssid");
     String req_pass = server.arg("pass");
 
+    strncpy(wifi_ssid, req_ssid.c_str(), sizeof(wifi_ssid) - 1);
+    strncpy(wifi_pass, req_pass.c_str(), sizeof(wifi_pass) - 1);
+
     FILE *f = fopen("/sdcard/config_wifi.txt", "w");
     if (f) {
-      fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", req_ssid.c_str(), req_pass.c_str(), mac_server);
+      fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", wifi_ssid, wifi_pass, mac_server);
       fclose(f);
     } else {
       sdCardError = true;
@@ -900,7 +910,7 @@ void handleConfigServer() {
 
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(req_ssid.c_str(), req_pass.c_str());
+    WiFi.begin(wifi_ssid, wifi_pass);
 
     int retries = 0;
     while (WiFi.status() != WL_CONNECTED && retries < 20) {
@@ -993,7 +1003,7 @@ void applyScreenPowerMode(AppScreen scr) {
     digitalWrite(PA_CTRL, HIGH);
     if (!codecport) {
       codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
-      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, 16);
+      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
       codecport->CodecPort_SetMicGain(35);
     }
   } else {
