@@ -429,17 +429,24 @@ void drawClockCalendarScreen() {
 
   canvas.fillRect(10, 95, 380, 2, 1);
 
+  // 1. Calendar Date Header with extra breathing room
   canvas.setFont(&FreeSansBold9pt7b);
   char dateHeader[32];
   sprintf(dateHeader, "%02d/%02d/%04d", cur_day, cur_mon, cur_year);
   canvas.setCursor(10, 114);
   canvas.print(dateHeader);
 
+  // 2. Weekday Row with taller, balanced highlight boxes
   const char* wLabels[] = {"S", "M", "T", "W", "T", "F", "S"};
-  int calX = 10, calY = 130, colW = 24, rowH = 18;
+  int calX = 10;
+  int calY = 136; // Lowered baseline gives more separation below the date
+  int colW = 24;
+  int rowH = 20;  // Expanded row pitch for taller highlights
+
   for (int c = 0; c < 7; c++) {
     if (c == cur_wday) {
-      canvas.fillRect(calX + (c * colW) - 2, calY - 12, colW, 15, 1);
+      // 18px tall rounded box with 3px top and 4px bottom padding
+      canvas.fillRoundRect(calX + (c * colW) - 1, calY - 13, 21, 18, 3, 1);
       canvas.setTextColor(0);
     } else {
       canvas.setTextColor(1);
@@ -449,6 +456,7 @@ void drawClockCalendarScreen() {
   }
   canvas.setTextColor(1);
 
+  // 3. Calendar Grid Generation
   struct tm firstDayTm = {0};
   firstDayTm.tm_year = cur_year - 1900;
   firstDayTm.tm_mon  = cur_mon - 1;
@@ -464,10 +472,11 @@ void drawClockCalendarScreen() {
     for (int c = 0; c < 7; c++) {
       if ((r == 0 && c < startCol) || dCount > totalDays) continue;
       int posX = calX + (c * colW);
-      int posY = calY + 16 + (r * rowH);
+      int posY = calY + 20 + (r * rowH);
 
       if (dCount == cur_day) {
-        canvas.fillRect(posX - 2, posY - 12, colW, 14, 1);
+        // 18px tall rounded box with generous top/bottom padding
+        canvas.fillRoundRect(posX - 1, posY - 13, 21, 18, 3, 1);
         canvas.setTextColor(0);
       } else {
         canvas.setTextColor(1);
@@ -478,8 +487,10 @@ void drawClockCalendarScreen() {
     }
   }
 
+  // Vertical Divider
   canvas.fillRect(182, 102, 2, 180, 1);
 
+  // Weather Unit
   canvas.setTextColor(1);
   canvas.setFont(&FreeSansBold18pt7b);
   canvas.setCursor(195, 130);
