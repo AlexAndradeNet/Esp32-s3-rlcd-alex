@@ -83,8 +83,6 @@ unsigned long lastRecButtonPress = 0;
 bool lastRecButtonState = HIGH;
 
 int lastDrawnMinute = -1;
-unsigned long lastWeatherSync = 0;
-const unsigned long WEATHER_SYNC_INTERVAL = 900000UL; // 15 mins
 
 // ---------- BUFFERS & CONFIGS ----------
 char config_buffer[2048] = {0};
@@ -100,7 +98,6 @@ int gmt_offset = -5;
 char location_override[16] = "false";
 char current_network[64] = "";
 char last_synced_city[32] = "";
-int lastWeatherSyncMinute = -1;
 bool timeSyncedToday = false;
 static volatile bool ntpPacketReceived = false;
 
@@ -139,355 +136,39 @@ bool isLeapYear(int yr) {
 }
 
 // Forward Declarations
-void loadSDClockConfig();
+void safeStrCopy(char *dest, const char *src, size_t destSize);
 void saveSDClockConfig();
 void saveWiFiTxtConfig();
+void saveAllConfigs();
 bool readWiFiDatabase(DynamicJsonDocument &doc);
 bool saveWiFiDatabase(DynamicJsonDocument &doc);
 bool isInWiFiDatabase(const char* ssid);
 void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt);
 void applyLocalizationStrategy();
-bool queryWPSCoordinates(float &lat, float &lon);
-bool queryIPCoordinates(float &lat, float &lon);
-bool obtainCoordinates(float &lat, float &lon);
-bool queryBigDataCloudCity();
-bool syncNTP();
 void updateOpenMeteo();
+bool syncNTP();
+bool ensureWiFiConnected(int maxWaitSec = 6);
+void disableWiFi();
+void transitionToScreen(AppScreen next);
+void drawClockCalendarScreen();
+void drawMeetingAssistantUI(const char* extraStatus = NULL);
+void startWiFiConfiguratorAP();
 
-// ================= DYNAMIC CPU POWER SCALING =================
+// ================= STRING & POWER UTILITIES =================
+void safeStrCopy(char *dest, const char *src, size_t destSize) {
+  if (!dest || destSize == 0) {
+    return;
+  }
+  if (!src) {
+    dest[0] = '\0';
+    return;
+  }
+  strncpy(dest, src, destSize - 1);
+  dest[destSize - 1] = '\0';
+}
+
 void setLowPowerClock(bool lowPower) {
-  if (lowPower) {
-    // 80 MHz preserves bus stability while cutting base CPU current by ~60%
-    setCpuFrequencyMhz(80);
-  } else {
-    // Boost clock for Wi-Fi, DNS/Web server, and audio capture
-    setCpuFrequencyMhz(160);
-  }
-}
-
-// ================= WI-FI POSITIONING SYSTEM (WPS) & GEOLOCATION =================
-bool queryWPSCoordinates(float &lat, float &lon) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  int n = WiFi.scanNetworks();
-  if (n <= 0) return false;
-
-  // Query Wi-Fi Positioning System using detected BSSID
-  for (int i = 0; i < n && i < 3; i++) {
-    String bssidStr = WiFi.BSSIDstr(i);
-    HTTPClient http;
-    String url = "https://api.mylnikov.org/geolocation/wifi?v=1.1&data=open&bssid=" + bssidStr;
-    http.begin(url);
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      DynamicJsonDocument doc(1024);
-      if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-        if (doc["result"] == 200 && doc["data"].containsKey("lat") && doc["data"].containsKey("lon")) {
-          lat = doc["data"]["lat"].as<float>();
-          lon = doc["data"]["lon"].as<float>();
-          http.end();
-          return true;
-        }
-      }
-    }
-    http.end();
-  }
-  return false;
-}
-
-bool queryIPCoordinates(float &lat, float &lon) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  HTTPClient http;
-  http.begin("http://ip-api.com/json/");
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
-    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-      if (doc.containsKey("lat") && doc.containsKey("lon")) {
-        lat = doc["lat"].as<float>();
-        lon = doc["lon"].as<float>();
-        http.end();
-        return true;
-      }
-    }
-  }
-  http.end();
-  return false;
-}
-
-bool obtainCoordinates(float &lat, float &lon) {
-  // 1. Attempt location via WPS (Wi-Fi Positioning System) first
-  if (queryWPSCoordinates(lat, lon)) {
-    return true;
-  }
-  // 2. If WPS fails, query ip-api.com to fetch network location coordinates
-  if (queryIPCoordinates(lat, lon)) {
-    return true;
-  }
-  return false;
-}
-
-bool queryBigDataCloudCity() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  HTTPClient http;
-  String url = String("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=") + latitude +
-               "&longitude=" + longitude + "&localityLanguage=en";
-  http.begin(url);
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
-    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-      const char* city = doc["city"];
-      const char* locality = doc["locality"];
-      if (city && strlen(city) > 0) {
-        strncpy(city_name, city, sizeof(city_name) - 1);
-        city_name[sizeof(city_name) - 1] = '\0';
-      } else if (locality && strlen(locality) > 0) {
-        strncpy(city_name, locality, sizeof(city_name) - 1);
-        city_name[sizeof(city_name) - 1] = '\0';
-      }
-      http.end();
-      return true;
-    }
-  }
-  http.end();
-  return false;
-}
-
-// ================= DATABASE PERSISTENCE =================
-bool readWiFiDatabase(DynamicJsonDocument &doc) {
-  FILE *f = fopen("/sdcard/wifi_database.json", "r");
-  if (!f) return false;
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (size <= 0) {
-    fclose(f);
-    return false;
-  }
-  char *buf = (char *)malloc(size + 1);
-  if (!buf) {
-    fclose(f);
-    return false;
-  }
-  fread(buf, 1, size, f);
-  buf[size] = '\0';
-  fclose(f);
-  DeserializationError err = deserializeJson(doc, buf);
-  free(buf);
-  return (err == DeserializationError::Ok);
-}
-
-bool saveWiFiDatabase(DynamicJsonDocument &doc) {
-  FILE *f = fopen("/sdcard/wifi_database.json", "w");
-  if (!f) {
-    return false;
-  }
-  
-  String jsonStr;
-  serializeJsonPretty(doc, jsonStr);
-  
-  size_t written = fwrite(jsonStr.c_str(), 1, jsonStr.length(), f);
-  fclose(f);
-  
-  return (written == jsonStr.length());
-}
-
-bool isInWiFiDatabase(const char* ssid) {
-  if (!ssid || strlen(ssid) == 0) return false;
-  DynamicJsonDocument doc(8192);
-  if (!readWiFiDatabase(doc) || !doc.is<JsonArray>()) return false;
-  for (JsonObject entry : doc.as<JsonArray>()) {
-    if (entry["essid"] && strcmp(entry["essid"], ssid) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt) {
-  if (!essid || strlen(essid) == 0) return;
-  DynamicJsonDocument doc(8192);
-  bool loaded = readWiFiDatabase(doc);
-  JsonArray arr;
-  if (loaded && doc.is<JsonArray>()) {
-    arr = doc.as<JsonArray>();
-  } else {
-    doc.clear();
-    arr = doc.to<JsonArray>();
-  }
-
-  bool exists = false;
-  for (JsonObject obj : arr) {
-    if (obj["essid"] && strcmp(obj["essid"], essid) == 0) {
-      obj["password"] = pass ? pass : "";
-      obj["city"] = city ? city : "";
-      obj["latitude"] = lat;
-      obj["longitude"] = lon;
-      obj["gmt"] = gmt;
-      exists = true;
-      break;
-    }
-  }
-  if (!exists) {
-    JsonObject entry = arr.createNestedObject();
-    entry["essid"] = essid;
-    entry["password"] = pass ? pass : "";
-    entry["city"] = city ? city : "";
-    entry["latitude"] = lat;
-    entry["longitude"] = lon;
-    entry["gmt"] = gmt;
-  }
-  saveWiFiDatabase(doc);
-}
-
-void saveWiFiTxtConfig() {
-  FILE *f = fopen("/sdcard/config_wifi.txt", "w");
-  if (f) {
-    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", wifi_ssid, wifi_pass, mac_server);
-    fclose(f);
-  } else {
-    sdCardError = true;
-  }
-}
-
-void handleFirstTimeConnection(const char* ssid, const char* pass) {
-  // 1. Get coordinates via WPS (Wi-Fi Positioning System) first; fallback to IP-API if WPS fails
-  float lat = (float)atof(latitude);
-  float lon = (float)atof(longitude);
-  if (obtainCoordinates(lat, lon)) {
-    dtostrf(lat, 6, 4, latitude);
-    dtostrf(lon, 6, 4, longitude);
-  }
-
-  // 2. Use coordinates to query the weather and calculate GMT offset from timezone_abbreviation
-  updateOpenMeteo();
-
-  // 3. Sync the time with NTP using the resolved timezone
-
-  // 4. Use BigDataCloud Reverse Geocoding to City API to get the city name
-  queryBigDataCloudCity();
-  strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
-
-  // 5. Save coordinates, city name, GMT offset, essid and password in the .txt files and json database
-  strncpy(wifi_ssid, ssid, sizeof(wifi_ssid) - 1);
-  wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
-  strncpy(wifi_pass, pass, sizeof(wifi_pass) - 1);
-  wifi_pass[sizeof(wifi_pass) - 1] = '\0';
-  saveWiFiTxtConfig();
-  saveSDClockConfig();
-
-  appendWiFiDatabase(ssid, pass, city_name, (float)atof(latitude), (float)atof(longitude), gmt_offset);
-}
-
-// ================= POWER-SAVING WI-FI MANAGERS =================
-bool ensureWiFiConnected(int maxWaitSec = 6) {
-  setLowPowerClock(false);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    lastKnownIP = WiFi.localIP().toString();
-    lastNetworkAvailable = true;
-    return true;
-  }
-
-  WiFi.mode(WIFI_STA);
-
-  // 1. Primary Attempt: Attempt to connect directly to the default network specified in .txt
-  bool connected = false;
-  if (strlen(wifi_ssid) > 0) {
-    WiFi.begin(wifi_ssid, wifi_pass);
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < (maxWaitSec * 2)) {
-      delay(500);
-      attempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      connected = true;
-    }
-  }
-
-  // 2. JSON Database Fallback: If the primary connection fails
-  if (!connected) {
-    WiFi.disconnect(true);
-    delay(200);
-    int n = WiFi.scanNetworks();
-    if (n > 0) {
-      DynamicJsonDocument dbDoc(8192);
-      if (readWiFiDatabase(dbDoc) && dbDoc.is<JsonArray>()) {
-        JsonArray arr = dbDoc.as<JsonArray>();
-        for (int i = 0; i < n && !connected; i++) {
-          String scannedSSID = WiFi.SSID(i);
-          for (JsonObject entry : arr) {
-            const char* db_essid = entry["essid"];
-            const char* db_pass = entry["password"];
-            if (db_essid && strlen(db_essid) > 0 && scannedSSID == db_essid) {
-              WiFi.begin(db_essid, db_pass ? db_pass : "");
-              int waitCount = 0;
-              while (WiFi.status() != WL_CONNECTED && waitCount < (maxWaitSec * 2)) {
-                delay(500);
-                waitCount++;
-              }
-              if (WiFi.status() == WL_CONNECTED) {
-                connected = true;
-                // Match found: connect and update .txt file to set SSID as new default
-                strncpy(wifi_ssid, db_essid, sizeof(wifi_ssid) - 1);
-                wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
-                strncpy(wifi_pass, db_pass ? db_pass : "", sizeof(wifi_pass) - 1);
-                wifi_pass[sizeof(wifi_pass) - 1] = '\0';
-                saveWiFiTxtConfig();
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (connected) {
-    lastKnownIP = WiFi.localIP().toString();
-    lastNetworkAvailable = true;
-
-    // First-Time Connection Setup
-    String activeSSID = WiFi.SSID();
-    if (!isInWiFiDatabase(activeSSID.c_str()) && currentScreen != SCREEN_MEETING) {
-      handleFirstTimeConnection(activeSSID.c_str(), wifi_pass);
-    }
-
-    // Screen 2 Behavior: Suppress all API calls for time, weather, and localization in Screen 2
-    if (currentScreen != SCREEN_MEETING) {
-      bool netChanged = false;
-      if (activeSSID.length() > 0 && strcmp(current_network, activeSSID.c_str()) != 0) {
-        netChanged = true;
-        strncpy(current_network, activeSSID.c_str(), sizeof(current_network) - 1);
-      }
-
-      applyLocalizationStrategy();
-
-      // City Change Handling: If city changed, sync time immediately upon connection
-      if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
-        strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
-      }
-
-      // Weather Data trigger: Whenever the active network changes
-      if (netChanged) {
-        updateOpenMeteo();
-      }
-    } else {
-      if (activeSSID.length() > 0) {
-        strncpy(current_network, activeSSID.c_str(), sizeof(current_network) - 1);
-      }
-    }
-
-    // Every time a connection is established, config_wifi.txt and config_clock.txt are created if they don't exist and overwritten
-    saveWiFiTxtConfig();
-    saveSDClockConfig();
-
-    return true;
-  } else {
-    lastKnownIP = "No Wi-Fi";
-    lastNetworkAvailable = false;
-    return false;
-  }
+  setCpuFrequencyMhz(lowPower ? 80 : 160);
 }
 
 void disableWiFi() {
@@ -506,21 +187,14 @@ void readBattery() {
 }
 
 int getBatteryPercentage(float vbat) {
-  if (vbat >= 4.15f) return 100;
-  if (vbat <= 3.40f) return 0;
+  if (vbat >= 4.15f) {
+    return 100;
+  }
+  if (vbat <= 3.40f) {
+    return 0;
+  }
   int pct = (int)roundf(((vbat - 3.40f) / (4.15f - 3.40f)) * 100.0f);
-  if (pct > 100) pct = 100;
-  if (pct < 0) pct = 0;
-  return pct;
-}
-
-int getBatteryBars(float vbat) {
-  if (vbat >= 4.00) return 5;
-  if (vbat >= 3.90) return 4;
-  if (vbat >= 3.80) return 3;
-  if (vbat >= 3.65) return 2;
-  if (vbat >= 3.50) return 1;
-  return 0;
+  return constrain(pct, 0, 100);
 }
 
 // ================= SHTC3 DRIVER VIA I2CBUS =================
@@ -550,18 +224,25 @@ bool shtc3_read_i2cbus(float &tempC, float &rh) {
   }
 
   uint8_t cmd_wake[2] = {0x35, 0x17};
-  if (i2c_master_transmit(shtc3_dev_handle, cmd_wake, 2, 50) != ESP_OK) return false;
+  if (i2c_master_transmit(shtc3_dev_handle, cmd_wake, 2, 50) != ESP_OK) {
+    return false;
+  }
   delay(1);
 
   uint8_t cmd_meas[2] = {0x78, 0x66};
-  if (i2c_master_transmit(shtc3_dev_handle, cmd_meas, 2, 50) != ESP_OK) return false;
+  if (i2c_master_transmit(shtc3_dev_handle, cmd_meas, 2, 50) != ESP_OK) {
+    return false;
+  }
   delay(20);
 
   uint8_t d[6] = {0};
-  if (i2c_master_receive(shtc3_dev_handle, d, 6, 50) != ESP_OK) return false;
+  if (i2c_master_receive(shtc3_dev_handle, d, 6, 50) != ESP_OK) {
+    return false;
+  }
 
-  if (crc8(&d[0], 2) != d[2]) return false;
-  if (crc8(&d[3], 2) != d[5]) return false;
+  if (crc8(&d[0], 2) != d[2] || crc8(&d[3], 2) != d[5]) {
+    return false;
+  }
 
   uint16_t tRaw  = (uint16_t)d[0] << 8 | d[1];
   uint16_t rhRaw = (uint16_t)d[3] << 8 | d[4];
@@ -571,7 +252,6 @@ bool shtc3_read_i2cbus(float &tempC, float &rh) {
 
   uint8_t cmd_sleep[2] = {0xB0, 0x98};
   i2c_master_transmit(shtc3_dev_handle, cmd_sleep, 2, 50);
-
   return true;
 }
 
@@ -585,11 +265,15 @@ void pushCanvasToRLCD(bool invert = false) {
     uint8_t *row = buf + y * bytesPerRow;
     for (int bx = 0; bx < bytesPerRow; bx++) {
       uint8_t v = row[bx];
-      if (invert) v ^= 0xFF;
+      if (invert) {
+        v ^= 0xFF;
+      }
       int x0 = bx * 8;
       for (int bit = 0; bit < 8; bit++) {
         int x = x0 + bit;
-        if (x >= W) break;
+        if (x >= W) {
+          break;
+        }
         if ((v & (0x80 >> bit)) != 0) {
           RlcdPort.RLCD_SetPixel((uint16_t)x, (uint16_t)y, ColorBlack);
         }
@@ -597,6 +281,97 @@ void pushCanvasToRLCD(bool invert = false) {
     }
   }
   RlcdPort.RLCD_Display();
+}
+
+// ================= GEOLOCATION UTILITIES =================
+bool obtainCoordinates(float &lat, float &lon) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  // 1. Wi-Fi Positioning System (WPS) via detected router BSSIDs
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n && i < 3; i++) {
+    HTTPClient http;
+    http.begin("https://api.mylnikov.org/geolocation/wifi?v=1.1&data=open&bssid=" + WiFi.BSSIDstr(i));
+    if (http.GET() == 200) {
+      DynamicJsonDocument doc(1024);
+      if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
+        if (doc["result"] == 200 && doc["data"].containsKey("lat")) {
+          lat = doc["data"]["lat"].as<float>();
+          lon = doc["data"]["lon"].as<float>();
+          http.end();
+          return true;
+        }
+      }
+    }
+    http.end();
+  }
+
+  // 2. IP-API Fallback
+  HTTPClient http;
+  http.begin("http://ip-api.com/json/");
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(2048);
+    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
+      if (doc.containsKey("lat")) {
+        lat = doc["lat"].as<float>();
+        lon = doc["lon"].as<float>();
+        http.end();
+        return true;
+      }
+    }
+  }
+  http.end();
+  return false;
+}
+
+void queryBigDataCloudCity() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  HTTPClient http;
+  http.begin("https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=" + String(latitude) +
+             "&longitude=" + String(longitude) + "&localityLanguage=en");
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(2048);
+    if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
+      const char* city = doc["city"];
+      const char* locality = doc["locality"];
+      if (city && city[0]) {
+        safeStrCopy(city_name, city, sizeof(city_name));
+      } else if (locality && locality[0]) {
+        safeStrCopy(city_name, locality, sizeof(city_name));
+      }
+    }
+  }
+  http.end();
+}
+
+// ================= SD CARD & DATABASE PERSISTENCE =================
+void saveWiFiTxtConfig() {
+  FILE *f = fopen("/sdcard/config_wifi.txt", "w");
+  if (f) {
+    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", wifi_ssid, wifi_pass, mac_server);
+    fclose(f);
+  } else {
+    sdCardError = true;
+  }
+}
+
+void saveSDClockConfig() {
+  FILE *f = fopen("/sdcard/config_clock.txt", "w");
+  if (f) {
+    fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\noverride=%s\n", city_name, latitude, longitude, gmt_offset, location_override);
+    fclose(f);
+  } else {
+    sdCardError = true;
+  }
+}
+
+void saveAllConfigs() {
+  saveWiFiTxtConfig();
+  saveSDClockConfig();
 }
 
 // ================= SD CARD CONFIGS & RETENTION =================
@@ -611,29 +386,15 @@ void loadSDClockConfig() {
         char *key = line;
         char *val = eq + 1;
         if (strcmp(key, "city") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(city_name, val, sizeof(city_name) - 1);
-            city_name[sizeof(city_name) - 1] = '\0';
-          }
+          safeStrCopy(city_name, val, sizeof(city_name));
         } else if (strcmp(key, "latitude") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(latitude, val, sizeof(latitude) - 1);
-            latitude[sizeof(latitude) - 1] = '\0';
-          }
+          safeStrCopy(latitude, val, sizeof(latitude));
         } else if (strcmp(key, "longitude") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(longitude, val, sizeof(longitude) - 1);
-            longitude[sizeof(longitude) - 1] = '\0';
-          }
-        } else if (strcmp(key, "gmt") == 0) {
-          if (val && strlen(val) > 0) {
-            gmt_offset = atoi(val);
-          }
+          safeStrCopy(longitude, val, sizeof(longitude));
+        } else if (strcmp(key, "gmt") == 0 && val[0]) {
+          gmt_offset = atoi(val);
         } else if (strcmp(key, "override") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(location_override, val, sizeof(location_override) - 1);
-            location_override[sizeof(location_override) - 1] = '\0';
-          }
+          safeStrCopy(location_override, val, sizeof(location_override));
         }
       }
       line = strtok(NULL, "\r\n");
@@ -641,19 +402,8 @@ void loadSDClockConfig() {
   }
 }
 
-void saveSDClockConfig() {
-  FILE *f = fopen("/sdcard/config_clock.txt", "w");
-  if (f) {
-    fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\noverride=%s\n", city_name, latitude, longitude, gmt_offset, location_override);
-    fclose(f);
-  } else {
-    sdCardError = true;
-  }
-}
-
 void loadSDConfigs() {
   sdcardPort = new CustomSDPort("/sdcard");
-  
   memset(config_buffer, 0, sizeof(config_buffer));
   if (sdcardPort->SDPort_ReadFile("/sdcard/config_wifi.txt", (uint8_t *)config_buffer, NULL) == 0) {
     char *line = strtok(config_buffer, "\r\n");
@@ -664,27 +414,104 @@ void loadSDConfigs() {
         char *key = line;
         char *val = eq + 1;
         if (strcmp(key, "wifi_ssid") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(wifi_ssid, val, sizeof(wifi_ssid) - 1);
-            wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
-          }
+          safeStrCopy(wifi_ssid, val, sizeof(wifi_ssid));
         } else if (strcmp(key, "wifi_pass") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(wifi_pass, val, sizeof(wifi_pass) - 1);
-            wifi_pass[sizeof(wifi_pass) - 1] = '\0';
-          }
+          safeStrCopy(wifi_pass, val, sizeof(wifi_pass));
         } else if (strcmp(key, "mac_server") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(mac_server, val, sizeof(mac_server) - 1);
-            mac_server[sizeof(mac_server) - 1] = '\0';
-          }
+          safeStrCopy(mac_server, val, sizeof(mac_server));
         }
       }
       line = strtok(NULL, "\r\n");
     }
+  } else {
+    sdCardError = true;
+  }
+  loadSDClockConfig();
+}
+
+bool readWiFiDatabase(DynamicJsonDocument &doc) {
+  FILE *f = fopen("/sdcard/wifi_database.json", "r");
+  if (!f) {
+    return false;
+  }
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (size <= 0) {
+    fclose(f);
+    return false;
+  }
+  
+  char *buf = (char *)malloc(size + 1);
+  if (!buf) {
+    fclose(f);
+    return false;
+  }
+  fread(buf, 1, size, f);
+  buf[size] = '\0';
+  fclose(f);
+
+  DeserializationError err = deserializeJson(doc, buf);
+  free(buf);
+  return (err == DeserializationError::Ok);
+}
+
+bool saveWiFiDatabase(DynamicJsonDocument &doc) {
+  FILE *f = fopen("/sdcard/wifi_database.json", "w");
+  if (!f) {
+    return false;
+  }
+  String jsonStr;
+  serializeJsonPretty(doc, jsonStr);
+  size_t written = fwrite(jsonStr.c_str(), 1, jsonStr.length(), f);
+  fclose(f);
+  return (written == jsonStr.length());
+}
+
+bool isInWiFiDatabase(const char* ssid) {
+  if (!ssid || !ssid[0]) {
+    return false;
+  }
+  DynamicJsonDocument doc(8192);
+  if (!readWiFiDatabase(doc) || !doc.is<JsonArray>()) {
+    return false;
+  }
+  for (JsonObject entry : doc.as<JsonArray>()) {
+    if (entry["essid"] && strcmp(entry["essid"], ssid) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt) {
+  if (!essid || !essid[0]) {
+    return;
+  }
+  DynamicJsonDocument doc(8192);
+  bool loaded = readWiFiDatabase(doc);
+  JsonArray arr = (loaded && doc.is<JsonArray>()) ? doc.as<JsonArray>() : doc.to<JsonArray>();
+
+  for (JsonObject obj : arr) {
+    if (obj["essid"] && strcmp(obj["essid"], essid) == 0) {
+      obj["password"] = pass ? pass : "";
+      obj["city"] = city ? city : "";
+      obj["latitude"] = lat;
+      obj["longitude"] = lon;
+      obj["gmt"] = gmt;
+      saveWiFiDatabase(doc);
+      return;
+    }
   }
 
-  loadSDClockConfig();
+  JsonObject entry = arr.createNestedObject();
+  entry["essid"] = essid;
+  entry["password"] = pass ? pass : "";
+  entry["city"] = city ? city : "";
+  entry["latitude"] = lat;
+  entry["longitude"] = lon;
+  entry["gmt"] = gmt;
+  saveWiFiDatabase(doc);
 }
 
 void cleanOldRecordings() {
@@ -698,13 +525,11 @@ void cleanOldRecordings() {
 
   time_t now;
   time(&now);
-
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     String fname = String(entry->d_name);
     if (fname.endsWith(".wav") && fname.length() >= 19) {
-      struct tm ftime;
-      memset(&ftime, 0, sizeof(ftime));
+      struct tm ftime = {0};
       int yr, mon, dy, hr, mn, sc;
       if (sscanf(fname.c_str(), "%4d%2d%2d_%2d%2d%2d.wav", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
         ftime.tm_year = yr - 1900;
@@ -713,10 +538,8 @@ void cleanOldRecordings() {
         ftime.tm_hour = hr;
         ftime.tm_min  = mn;
         ftime.tm_sec  = sc;
-        time_t f_epoch = mktime(&ftime);
-        if (difftime(now, f_epoch) > 172800) { 
-          String fullPath = String("/sdcard/meetings/") + fname;
-          unlink(fullPath.c_str());
+        if (difftime(now, mktime(&ftime)) > 172800) {
+          unlink(("/sdcard/meetings/" + fname).c_str());
         }
       }
     }
@@ -725,48 +548,57 @@ void cleanOldRecordings() {
 }
 
 // ================= LOCALIZATION STRATEGY =================
+void handleFirstTimeConnection(const char* ssid, const char* pass) {
+  float lat = (float)atof(latitude);
+  float lon = (float)atof(longitude);
+  if (obtainCoordinates(lat, lon)) {
+    dtostrf(lat, 6, 4, latitude);
+    dtostrf(lon, 6, 4, longitude);
+  }
+
+  updateOpenMeteo();
+  queryBigDataCloudCity();
+  safeStrCopy(last_synced_city, city_name, sizeof(last_synced_city));
+
+  safeStrCopy(wifi_ssid, ssid, sizeof(wifi_ssid));
+  safeStrCopy(wifi_pass, pass, sizeof(wifi_pass));
+  saveAllConfigs();
+  appendWiFiDatabase(ssid, pass, city_name, (float)atof(latitude), (float)atof(longitude), gmt_offset);
+}
+
 void applyLocalizationStrategy() {
-  // Offline Mode (No Internet): Mandatory read from local file data, ignoring override flag entirely
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED || strcasecmp(location_override, "true") == 0) {
     loadSDClockConfig();
     return;
   }
 
-  // Online Mode:
-  // If override=true in the .txt file: Read location details directly from the .txt file
-  if (strcasecmp(location_override, "true") == 0) {
-    loadSDClockConfig();
-  } else {
-    // If override=false or empty: Read location details from wifi_database.json associated with active network
-    String currentSSID = WiFi.SSID();
-    DynamicJsonDocument doc(8192);
-    bool foundInDb = false;
+  String currentSSID = WiFi.SSID();
+  DynamicJsonDocument doc(8192);
+  bool foundInDb = false;
 
-    if (readWiFiDatabase(doc) && doc.is<JsonArray>()) {
-      for (JsonObject entry : doc.as<JsonArray>()) {
-        if (entry["essid"] && currentSSID == entry["essid"].as<const char*>()) {
-          if (entry["city"] && strlen(entry["city"].as<const char*>()) > 0) {
-            strncpy(city_name, entry["city"], sizeof(city_name) - 1);
-            city_name[sizeof(city_name) - 1] = '\0';
-          }
-          if (entry.containsKey("latitude") && !entry["latitude"].isNull()) {
-            dtostrf(entry["latitude"].as<float>(), 6, 4, latitude);
-          }
-          if (entry.containsKey("longitude") && !entry["longitude"].isNull()) {
-            dtostrf(entry["longitude"].as<float>(), 6, 4, longitude);
-          }
-          if (entry.containsKey("gmt") && !entry["gmt"].isNull()) {
-            gmt_offset = entry["gmt"].as<int>();
-          }
-          foundInDb = true;
-          break;
+  if (readWiFiDatabase(doc) && doc.is<JsonArray>()) {
+    for (JsonObject entry : doc.as<JsonArray>()) {
+      if (entry["essid"] && currentSSID == entry["essid"].as<const char*>()) {
+        if (entry["city"] && entry["city"].as<const char*>()[0]) {
+          safeStrCopy(city_name, entry["city"], sizeof(city_name));
         }
+        if (entry.containsKey("latitude") && !entry["latitude"].isNull()) {
+          dtostrf(entry["latitude"].as<float>(), 6, 4, latitude);
+        }
+        if (entry.containsKey("longitude") && !entry["longitude"].isNull()) {
+          dtostrf(entry["longitude"].as<float>(), 6, 4, longitude);
+        }
+        if (entry.containsKey("gmt") && !entry["gmt"].isNull()) {
+          gmt_offset = entry["gmt"].as<int>();
+        }
+        foundInDb = true;
+        break;
       }
     }
+  }
 
-    if (!foundInDb) {
-      handleFirstTimeConnection(currentSSID.c_str(), wifi_pass);
-    }
+  if (!foundInDb) {
+    handleFirstTimeConnection(currentSSID.c_str(), wifi_pass);
   }
 }
 
@@ -776,7 +608,9 @@ void timeSyncNotificationCallback(struct timeval *tv) {
 }
 
 bool syncNTP() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
 
   ntpPacketReceived = false;
   if (esp_sntp_enabled()) {
@@ -791,14 +625,14 @@ bool syncNTP() {
     delay(400);
     retry++;
   }
-
-  // If no NTP packet arrived over internet, exit without modifying RTC
   if (!ntpPacketReceived) {
     return false;
   }
 
   struct tm ti;
-  if (!getLocalTime(&ti, 2000)) return false;
+  if (!getLocalTime(&ti, 2000)) {
+    return false;
+  }
 
   rtc.setDate(ti.tm_wday, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
   rtc.setTime(ti.tm_hour, ti.tm_min, ti.tm_sec);
@@ -810,6 +644,7 @@ void updateOpenMeteo() {
     lastWeatherSuccess = false;
     return;
   }
+
   HTTPClient http;
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=") + latitude +
                "&longitude=" + longitude +
@@ -822,21 +657,13 @@ void updateOpenMeteo() {
   if (httpCode == 200) {
     DynamicJsonDocument doc(12288);
     deserializeJson(doc, http.getString());
-    
+
     // Extract timezone abbreviation and calculate GMT offset
     if (doc.containsKey("timezone_abbreviation") && !doc["timezone_abbreviation"].isNull()) {
       const char* tz_abbr = doc["timezone_abbreviation"].as<const char*>();
       const char* p = strstr(tz_abbr, "GMT");
-      if (p) {
-        gmt_offset = atoi(p + 3);
-      } else {
-        int parsed = atoi(tz_abbr);
-        if (parsed != 0) {
-          gmt_offset = parsed;
-        }
-      }
+      gmt_offset = p ? atoi(p + 3) : atoi(tz_abbr);
     }
-    // Reliable fallback: Open-Meteo always provides exact offset in seconds
     if (doc.containsKey("utc_offset_seconds")) {
       gmt_offset = doc["utc_offset_seconds"].as<int>() / 3600;
     }
@@ -850,23 +677,32 @@ void updateOpenMeteo() {
     min_temp = round(doc["daily"]["temperature_2m_min"][0].as<float>());
     precip_sum = doc["daily"]["precipitation_sum"][0].as<float>();
     rain_prob_max = round(doc["daily"]["precipitation_probability_max"][0].as<float>());
-
     will_rain = (rain_prob_max > 30 || precip_sum > 0.5f);
 
-    if (weather_code <= 1) strcpy(weather_label, "Clear");
-    else if (weather_code <= 3) strcpy(weather_label, "Cloudy");
-    else if (weather_code <= 48) strcpy(weather_label, "Foggy");
-    else if (weather_code <= 67 || (weather_code >= 80 && weather_code <= 82)) strcpy(weather_label, "Rainy");
-    else if ((weather_code >= 71 && weather_code <= 77) || weather_code == 85 || weather_code == 86) strcpy(weather_label, "Snow");
-    else if (weather_code >= 95) strcpy(weather_label, "Storm");
-    else strcpy(weather_label, "Fair");
+    const char *label = "Fair";
+    if (weather_code <= 1) {
+      label = "Clear";
+    } else if (weather_code <= 3) {
+      label = "Cloudy";
+    } else if (weather_code <= 48) {
+      label = "Foggy";
+    } else if (weather_code <= 67 || (weather_code >= 80 && weather_code <= 82)) {
+      label = "Rainy";
+    } else if ((weather_code >= 71 && weather_code <= 77) || weather_code == 85 || weather_code == 86) {
+      label = "Snow";
+    } else if (weather_code >= 95) {
+      label = "Storm";
+    }
+    safeStrCopy(weather_label, label, sizeof(weather_label));
 
     rain_start_hour = -1;
     rain_stop_hour = -1;
     JsonArray hourly_precip = doc["hourly"]["precipitation"];
     for (int h_idx = 0; h_idx < min(24, (int)hourly_precip.size()); h_idx++) {
       if (hourly_precip[h_idx].as<float>() > 0.1f) {
-        if (rain_start_hour == -1) rain_start_hour = h_idx;
+        if (rain_start_hour == -1) {
+          rain_start_hour = h_idx;
+        }
         rain_stop_hour = h_idx + 1;
       }
     }
@@ -875,6 +711,113 @@ void updateOpenMeteo() {
     lastWeatherSuccess = false;
   }
   http.end();
+}
+
+// ================= POWER-SAVING WI-FI MANAGERS =================
+bool ensureWiFiConnected(int maxWaitSec) {
+  setLowPowerClock(false);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    lastKnownIP = WiFi.localIP().toString();
+    lastNetworkAvailable = true;
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  bool connected = false;
+
+  // 1. Primary Attempt from .txt
+  if (wifi_ssid[0]) {
+    WiFi.begin(wifi_ssid, wifi_pass);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < (maxWaitSec * 2)) {
+      delay(500);
+      attempts++;
+    }
+    connected = (WiFi.status() == WL_CONNECTED);
+  }
+
+  // 2. Database Fallback Scan
+  if (!connected) {
+    WiFi.disconnect(true);
+    delay(200);
+    int n = WiFi.scanNetworks();
+    if (n > 0) {
+      DynamicJsonDocument dbDoc(8192);
+      if (readWiFiDatabase(dbDoc) && dbDoc.is<JsonArray>()) {
+        for (int i = 0; i < n && !connected; i++) {
+          String scannedSSID = WiFi.SSID(i);
+          for (JsonObject entry : dbDoc.as<JsonArray>()) {
+            const char* db_essid = entry["essid"];
+            if (db_essid && db_essid[0] && scannedSSID == db_essid) {
+              const char* db_pass = entry["password"];
+              WiFi.begin(db_essid, db_pass ? db_pass : "");
+              int waitCount = 0;
+              while (WiFi.status() != WL_CONNECTED && waitCount < (maxWaitSec * 2)) {
+                delay(500);
+                waitCount++;
+              }
+              if (WiFi.status() == WL_CONNECTED) {
+                connected = true;
+                safeStrCopy(wifi_ssid, db_essid, sizeof(wifi_ssid));
+                safeStrCopy(wifi_pass, db_pass ? db_pass : "", sizeof(wifi_pass));
+                saveWiFiTxtConfig();
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (connected) {
+    lastKnownIP = WiFi.localIP().toString();
+    lastNetworkAvailable = true;
+    String activeSSID = WiFi.SSID();
+
+    if (!isInWiFiDatabase(activeSSID.c_str()) && currentScreen != SCREEN_MEETING) {
+      handleFirstTimeConnection(activeSSID.c_str(), wifi_pass);
+    }
+
+    if (currentScreen != SCREEN_MEETING) {
+      bool netChanged = (activeSSID.length() > 0 && strcmp(current_network, activeSSID.c_str()) != 0);
+      if (netChanged) {
+        safeStrCopy(current_network, activeSSID.c_str(), sizeof(current_network));
+      }
+
+      applyLocalizationStrategy();
+      if (last_synced_city[0] && strcmp(last_synced_city, city_name) != 0) {
+        safeStrCopy(last_synced_city, city_name, sizeof(last_synced_city));
+      }
+      if (netChanged) {
+        updateOpenMeteo();
+      }
+    } else if (activeSSID.length() > 0) {
+      safeStrCopy(current_network, activeSSID.c_str(), sizeof(current_network));
+    }
+
+    saveAllConfigs();
+    return true;
+  } else {
+    lastKnownIP = "No Wi-Fi";
+    lastNetworkAvailable = false;
+    return false;
+  }
+}
+
+bool syncWeather() {
+  setLowPowerClock(false);
+  bool success = false;
+  if (ensureWiFiConnected(6)) {
+    updateOpenMeteo();
+    saveSDClockConfig();
+    success = lastWeatherSuccess;
+  }
+  if (currentScreen == SCREEN_CLOCK) {
+    disableWiFi();
+  }
+  return success;
 }
 
 // ================= SCREEN 1: CLOCK & CALENDAR =================
@@ -888,9 +831,15 @@ void drawClockCalendarScreen() {
   int cur_mon  = rtc.getMonth();
   int cur_year = rtc.getYear();
 
-  if (cur_mon < 1 || cur_mon > 12) cur_mon = 1;
-  if (cur_year < 2000) cur_year = 2026;
-  if (cur_day < 1 || cur_day > 31) cur_day = 1;
+  if (cur_mon < 1 || cur_mon > 12) {
+    cur_mon = 1;
+  }
+  if (cur_year < 2000) {
+    cur_year = 2026;
+  }
+  if (cur_day < 1 || cur_day > 31) {
+    cur_day = 1;
+  }
 
   char timeBuf[8];
   sprintf(timeBuf, "%02d:%02d", cur_hour, cur_min);
@@ -913,30 +862,23 @@ void drawClockCalendarScreen() {
   int16_t bx1, by1;
   uint16_t bw, bh;
   canvas.getTextBounds(batStr, 0, 0, &bx1, &by1, &bw, &bh);
-  int textX = (bX + 3) + (40 - (int)bw) / 2 - bx1;
-  int textY = (bY + 3) + (16 - (int)bh) / 2 - by1;
-  canvas.setCursor(textX, textY);
+  canvas.setCursor((bX + 3) + (40 - (int)bw) / 2 - bx1, (bY + 3) + (16 - (int)bh) / 2 - by1);
   canvas.print(batStr);
 
   canvas.fillRect(10, 95, 380, 2, 1);
 
-  // 1. Calendar Date Header with extra breathing room
-  canvas.setFont(&FreeSansBold9pt7b);
+  // Date Header
   char dateHeader[32];
   sprintf(dateHeader, "%02d/%02d/%04d", cur_day, cur_mon, cur_year);
   canvas.setCursor(10, 114);
   canvas.print(dateHeader);
 
-  // 2. Weekday Row with taller, balanced highlight boxes
+  // Weekdays
   const char *wLabels[] = {"S", "M", "T", "W", "T", "F", "S"};
-  int calX = 10;
-  int calY = 136; // Lowered baseline gives more separation below the date
-  int colW = 24;
-  int rowH = 20;  // Expanded row pitch for taller highlights
+  int calX = 10, calY = 136, colW = 24, rowH = 20;
 
   for (int c = 0; c < 7; c++) {
     if (c == cur_wday) {
-      // 18px tall rounded box with 3px top and 4px bottom padding
       canvas.fillRoundRect(calX + (c * colW) - 1, calY - 13, 21, 18, 3, 1);
       canvas.setTextColor(0);
     } else {
@@ -947,41 +889,40 @@ void drawClockCalendarScreen() {
   }
   canvas.setTextColor(1);
 
-  // 3. Calendar Grid Generation
+  // Calendar Days
   struct tm firstDayTm = {0};
   firstDayTm.tm_year = cur_year - 1900;
   firstDayTm.tm_mon  = cur_mon - 1;
   firstDayTm.tm_mday = 1;
   mktime(&firstDayTm);
-  int startCol = firstDayTm.tm_wday;
 
   int totalDays = daysPerMonth[cur_mon - 1];
-  if (cur_mon == 2 && isLeapYear(cur_year)) totalDays = 29;
+  if (cur_mon == 2 && isLeapYear(cur_year)) {
+    totalDays = 29;
+  }
 
   int dCount = 1;
   for (int r = 0; r < 6; r++) {
     for (int c = 0; c < 7; c++) {
-      if ((r == 0 && c < startCol) || dCount > totalDays) continue;
+      if ((r == 0 && c < firstDayTm.tm_wday) || dCount > totalDays) {
+        continue;
+      }
       int posX = calX + (c * colW);
       int posY = calY + 20 + (r * rowH);
 
       if (dCount == cur_day) {
-        // 18px tall rounded box with generous top/bottom padding
         canvas.fillRoundRect(posX - 1, posY - 13, 21, 18, 3, 1);
         canvas.setTextColor(0);
       } else {
         canvas.setTextColor(1);
       }
       canvas.setCursor(posX, posY);
-      canvas.printf("%2d", dCount);
-      dCount++;
+      canvas.printf("%2d", dCount++);
     }
   }
 
-  // Vertical Divider
+  // Divider & Weather Panel
   canvas.fillRect(182, 102, 2, 180, 1);
-
-  // Weather Unit
   canvas.setTextColor(1);
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(195, 114);
@@ -997,19 +938,16 @@ void drawClockCalendarScreen() {
 
   canvas.setCursor(195, 168);
   canvas.printf("Min/Max: %d / %dC", min_temp, max_temp);
-
   canvas.setCursor(195, 186);
   canvas.printf("Feels: %dC | Hum: %d%%", feels_like, cur_humidity);
-
   canvas.setCursor(195, 204);
   canvas.printf("Rain?: %s (%d%%)", will_rain ? "Yes" : "No", rain_prob_max);
 
+  canvas.setCursor(195, 222);
   if (rain_start_hour != -1) {
-    canvas.setCursor(195, 222);
     canvas.printf("Rain: %02d:00-%02d:00", rain_start_hour, rain_stop_hour);
   } else {
-    canvas.setCursor(195, 222);
-    canvas.printf("Rain: None expected");
+    canvas.print("Rain: None expected");
   }
 
   canvas.setCursor(195, 240);
@@ -1019,15 +957,13 @@ void drawClockCalendarScreen() {
   canvas.setCursor(195, 262);
   canvas.printf("Local: %dC | %d%% RH", (int)round(temp_shtc3), (int)round(hum_shtc3));
 
-  // Footer: Cached IP address displayed in bottom-left corner
-  canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(10, 285);
   canvas.print(lastKnownIP);
 
   pushCanvasToRLCD(false);
 }
 
-// ================= SCREEN 2: MEETING ASSISTANT (16-BIT PCM WAV) =================
+// ================= SCREEN 2: MEETING ASSISTANT =================
 void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer, "RIFF", 4);
   uint32_t chunkSize = dataSize + 36;
@@ -1049,13 +985,14 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 28, &byteRate, 4);
   memcpy(buffer + 32, &blockAlign, 2);
   memcpy(buffer + 34, &bitsPerSample, 2);
-
   memcpy(buffer + 36, "data", 4);
   memcpy(buffer + 40, &dataSize, 4);
 }
 
 void streamFileToBackend(const char* filepath) {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
@@ -1086,13 +1023,8 @@ void streamFileToBackend(const char* filepath) {
   String tail = "\r\n--" + boundary + "--\r\n";
   long totalLen = head.length() + fileSize + tail.length();
 
-  client.print("POST /api/transcribe HTTP/1.1\r\n");
-  client.print("Host: " + host + "\r\n");
-  client.print("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
-  client.print("Content-Length: " + String(totalLen) + "\r\n");
-  client.print("Connection: close\r\n\r\n");
-
-  client.print(head);
+  client.print("POST /api/transcribe HTTP/1.1\r\nHost: " + host + "\r\nContent-Type: multipart/form-data; boundary=" + boundary +
+               "\r\nContent-Length: " + String(totalLen) + "\r\nConnection: close\r\n\r\n" + head);
 
   uint8_t sendBuf[2048];
   while (fileSize > 0) {
@@ -1105,60 +1037,46 @@ void streamFileToBackend(const char* filepath) {
       break;
     }
   }
-
   client.print(tail);
   fclose(f);
 
   unsigned long timeout = millis();
   while (client.connected() && millis() - timeout < 5000) {
-    if (client.available()) break;
+    if (client.available()) {
+      break;
+    }
     delay(10);
   }
   client.stop();
 }
 
-void drawMeetingAssistantUI(const char* extraStatus = NULL) {
+void drawMeetingAssistantUI(const char* extraStatus) {
   canvas.fillScreen(0);
   canvas.setTextColor(1);
-  
   canvas.setFont(&FreeSansBold12pt7b);
   canvas.setCursor(20, 45);
   canvas.print("Meeting Assistant");
 
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(20, 75);
-  if (lastNetworkAvailable) {
-    canvas.print("Network: Ready (Cloud Sync)");
-  } else {
-    canvas.print("Network: Offline (SD Card Only)");
-  }
-
+  canvas.print(lastNetworkAvailable ? "Network: Ready (Cloud Sync)" : "Network: Offline (SD Card Only)");
   canvas.fillRect(20, 88, 360, 2, 1);
 
   // ---------- SD ERROR WARNING DIALOG ----------
   if (sdCardError) {
     canvas.fillRoundRect(20, 105, 360, 140, 6, 1);
     canvas.setTextColor(0);
-    
     canvas.setFont(&FreeSansBold12pt7b);
     canvas.setCursor(35, 140);
     canvas.print("SD Card Error!");
-
     canvas.setFont(&FreeSansBold9pt7b);
     canvas.setCursor(35, 175);
-    canvas.print("The SD card was not read or");
-    canvas.setCursor(35, 198);
-    canvas.print("timed out during operation.");
-    
-    canvas.setCursor(35, 230);
-    canvas.print("Please restart the device.");
-    
+    canvas.print("The SD card was not read or\ntimed out during operation.\nPlease restart the device.");
     canvas.setTextColor(1);
     pushCanvasToRLCD(false);
     return;
   }
 
-  // Mandatory instructions
   canvas.setFont(&FreeSansBold9pt7b);
   canvas.setCursor(20, 115);
   canvas.print("Press the right button");
@@ -1168,7 +1086,6 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
   if (isRecording) {
     canvas.drawCircle(40, 185, 14, 1);
     canvas.fillCircle(40, 185, 9, 1);
-
     canvas.setFont(&FreeSansBold12pt7b);
     canvas.setCursor(65, 192);
     canvas.print("RECORDING...");
@@ -1176,39 +1093,35 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
     unsigned long elapsedSec = (millis() - recordingStartTime) / 1000;
     char timerBuf[16];
     sprintf(timerBuf, "%02lu:%02lu", elapsedSec / 60, elapsedSec % 60);
-
     canvas.setFont(&FreeSansBold18pt7b);
     canvas.setCursor(65, 235);
     canvas.print(timerBuf);
   } else {
     canvas.drawCircle(40, 185, 14, 1);
-
     canvas.setFont(&FreeSansBold12pt7b);
     canvas.setCursor(65, 192);
     canvas.print("Ready to Record");
 
-    if (extraStatus != NULL) {
-      canvas.setFont(&FreeSansBold9pt7b);
-      canvas.setCursor(20, 235);
+    canvas.setFont(&FreeSansBold9pt7b);
+    canvas.setCursor(20, 235);
+    if (extraStatus) {
       canvas.print(extraStatus);
-    } else if (strlen(currentMeetingFileName) > 0) {
-      canvas.setFont(&FreeSansBold9pt7b);
-      canvas.setCursor(20, 235);
+    } else if (currentMeetingFileName[0]) {
       canvas.print("Last: ");
       const char *shortName = strrchr(currentMeetingFileName, '/');
       canvas.print(shortName ? shortName + 1 : currentMeetingFileName);
     }
   }
-
   pushCanvasToRLCD(false);
 }
 
 void startMeetingRecording() {
-  if (sdCardError) return;
+  if (sdCardError) {
+    return;
+  }
 
   sprintf(currentMeetingFileName, "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d.wav",
-          rtc.getYear(), rtc.getMonth(), rtc.getDay(),
-          rtc.getHour(), rtc.getMinute(), rtc.getSecond());
+          rtc.getYear(), rtc.getMonth(), rtc.getDay(), rtc.getHour(), rtc.getMinute(), rtc.getSecond());
 
   currentMeetingFile = fopen(currentMeetingFileName, "wb");
   if (!currentMeetingFile) {
@@ -1229,7 +1142,6 @@ void startMeetingRecording() {
   totalRecordedBytes = 0;
   recordingStartTime = millis();
   isRecording = true;
-
   drawMeetingAssistantUI();
 }
 
@@ -1237,14 +1149,14 @@ void stopMeetingRecording() {
   isRecording = false;
 
   if (currentMeetingFile) {
-    if (fseek(currentMeetingFile, 0, SEEK_SET) != 0) {
-      sdCardError = true;
-    } else {
+    if (fseek(currentMeetingFile, 0, SEEK_SET) == 0) {
       uint8_t header[44];
       writeWavHeader(header, totalRecordedBytes);
       if (fwrite(header, 1, 44, currentMeetingFile) < 44) {
         sdCardError = true;
       }
+    } else {
+      sdCardError = true;
     }
     fclose(currentMeetingFile);
     currentMeetingFile = NULL;
@@ -1257,70 +1169,57 @@ void stopMeetingRecording() {
 
   // Re-establish connection during audio sync and disable after transmission concludes
   drawMeetingAssistantUI("Connecting Wi-Fi...");
-  setLowPowerClock(false); // Boost CPU for high-speed transmission
-  bool connected = ensureWiFiConnected(6);
+  setLowPowerClock(false);
 
-  if (connected) {
+  if (ensureWiFiConnected(6)) {
     drawMeetingAssistantUI("Syncing to Mac...");
     streamFileToBackend(currentMeetingFileName);
     drawMeetingAssistantUI("Saved & Transmitted!");
-    disableWiFi(); // Immediately shut down Wi-Fi after transmission concludes
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
-    disableWiFi(); // Power down Wi-Fi if connection attempt fails
   }
+  disableWiFi();
 }
 
-// ================= DYNAMIC QR CODE GENERATOR (NATIVE ESP-IDF) =================
+// ================= SCREEN 3: QR CONFIG =================
 static void qrcode_canvas_draw(esp_qrcode_handle_t qrcode) {
   int size = esp_qrcode_get_size(qrcode);
-  int maxPixelSize = 155;
-  int scale = maxPixelSize / size;
-  if (scale < 1) scale = 1;
-  int qrWidth = size * scale;
-  int startX = (190 - qrWidth) / 2;
-  int startY = 60;
+  int scale = max(1, 155 / size);
+  int startX = (190 - (size * scale)) / 2;
 
   for (int y = 0; y < size; y++) {
     for (int x = 0; x < size; x++) {
       if (esp_qrcode_get_module(qrcode, x, y)) {
-        canvas.fillRect(startX + (x * scale), startY + (y * scale), scale, scale, 1);
+        canvas.fillRect(startX + (x * scale), 60 + (y * scale), scale, scale, 1);
       }
     }
   }
 }
 
-void drawDynamicQRCode(const char* text) {
-  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
-  cfg.display_func = qrcode_canvas_draw;
-  cfg.max_qrcode_version = 5;
-  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
-  esp_qrcode_generate(&cfg, text);
-}
+void startWiFiConfiguratorAP() {
+  setLowPowerClock(false);
 
-void handleConfigServer() {
+  IPAddress apIP(192, 168, 5, 1);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  dnsServer.start(53, "*", apIP);
+
   server.on("/", HTTP_GET, []() {
     int n = WiFi.scanNetworks();
-    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'/><style>body{font-family:sans-serif;padding:20px;}</style></head><body>";
-    html += "<h2>Intelligent-Clock WiFi Wizard</h2><form method='POST' action='/save'>";
-    html += "<label>Select Network:</label><br><select name='ssid'>";
+    String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'/></head><body>"
+                  "<h2>WiFi Wizard</h2><form method='POST' action='/save'>"
+                  "<label>SSID:</label><br><select name='ssid'>";
     for (int i = 0; i < n; i++) {
       html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + String(WiFi.RSSI(i)) + "dBm)</option>";
     }
-    html += "</select><br><br><label>Password:</label><br><input type='password' name='pass'/><br><br>";
-    html += "<input type='submit' value='Connect & Save'/></form></body></html>";
+    html += "</select><br><br><label>Password:</label><br><input type='password' name='pass'/><br><br>"
+            "<input type='submit' value='Connect & Save'/></form></body></html>";
     server.send(200, "text/html", html);
   });
 
   server.on("/save", HTTP_POST, []() {
-    String req_ssid = server.arg("ssid");
-    String req_pass = server.arg("pass");
-
-    // Adding a network via Screen 3 overwrites the default network in the .txt file
-    strncpy(wifi_ssid, req_ssid.c_str(), sizeof(wifi_ssid) - 1);
-    wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
-    strncpy(wifi_pass, req_pass.c_str(), sizeof(wifi_pass) - 1);
-    wifi_pass[sizeof(wifi_pass) - 1] = '\0';
+    safeStrCopy(wifi_ssid, server.arg("ssid").c_str(), sizeof(wifi_ssid));
+    safeStrCopy(wifi_pass, server.arg("pass").c_str(), sizeof(wifi_pass));
     saveWiFiTxtConfig();
 
     server.send(200, "text/html", "<html><body><h3>Credentials Saved! Connecting...</h3></body></html>");
@@ -1340,118 +1239,97 @@ void handleConfigServer() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-      // First-Time Setup: WPS coordinates -> Weather (GMT) -> NTP -> BigDataCloud City -> Save
       handleFirstTimeConnection(wifi_ssid, wifi_pass);
       lastKnownIP = WiFi.localIP().toString();
       lastNetworkAvailable = true;
-      saveWiFiTxtConfig();
-      saveSDClockConfig();
+      saveAllConfigs();
       disableWiFi();
-
-      // If a wifi connection is stablished when in the third screen, then go to first screen
-      previousScreen = SCREEN_CONFIG;
-      currentScreen = SCREEN_CLOCK;
-      applyScreenPowerMode(currentScreen);
-      drawClockCalendarScreen();
-      setLowPowerClock(true);
+      transitionToScreen(SCREEN_CLOCK);
     } else {
       lastKnownIP = "No Wi-Fi";
       lastNetworkAvailable = false;
       startWiFiConfiguratorAP();
     }
   });
-}
 
-// ================= SCREEN 3: DYNAMIC PASSWORDLESS QR CONFIG =================
-void startWiFiConfiguratorAP() {
-  setLowPowerClock(false); // Boost CPU for handling DNS and Web server requests
-
-  IPAddress apIP(192, 168, 5, 1);
-  IPAddress netMsk(255, 255, 255, 0);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(apIP, apIP, netMsk);
-
-  dnsServer.start(53, "*", apIP);
-  handleConfigServer();
   server.begin();
 
-  // Read the active SoftAP SSID
   String defaultSSID = WiFi.softAPSSID();
   if (defaultSSID.length() == 0) {
     defaultSSID = "Intelligent-Clock";
   }
 
-  // Standard open/passwordless Wi-Fi QR format
-  String qrPayload = "WIFI:S:" + defaultSSID + ";T:nopass;;";
-
   canvas.fillScreen(0);
-  
-  // Dynamically generated QR code
-  drawDynamicQRCode(qrPayload.c_str());
+  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+  cfg.display_func = qrcode_canvas_draw;
+  cfg.max_qrcode_version = 5;
+  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  esp_qrcode_generate(&cfg, ("WIFI:S:" + defaultSSID + ";T:nopass;;").c_str());
 
   canvas.fillRect(190, 30, 2, 240, 1);
-
   canvas.setTextColor(1);
   canvas.setFont(&FreeSansBold12pt7b);
   canvas.setCursor(205, 45);
   canvas.print("WiFi Setup");
 
   canvas.setFont(&FreeSansBold9pt7b);
-  canvas.setCursor(205, 75);  
+  canvas.setCursor(205, 75);
   canvas.print("1. Scan QR Code");
-
-  canvas.setCursor(205, 100); 
+  canvas.setCursor(205, 100);
   canvas.print("   Network (SSID):");
-  
-  canvas.setCursor(205, 120); 
+  canvas.setCursor(205, 120);
   canvas.print("   " + defaultSSID);
-
-  canvas.setCursor(205, 142); 
+  canvas.setCursor(205, 142);
   canvas.print("   (Passwordless)");
-
-  canvas.setCursor(205, 172); 
+  canvas.setCursor(205, 172);
   canvas.print("2. Open browser at:");
-
-  canvas.setCursor(205, 192); 
+  canvas.setCursor(205, 192);
   canvas.print("   http://192.168.5.1");
-
-  canvas.setCursor(205, 225); 
+  canvas.setCursor(205, 225);
   canvas.print("3. Follow Wizard");
-
   pushCanvasToRLCD(false);
 }
 
-// ================= POWER & DISPATCH =================
-void applyScreenPowerMode(AppScreen scr) {
-  if (scr == SCREEN_MEETING) {
-    setLowPowerClock(false); // Boost CPU for 16 kHz I2S audio reading
-    digitalWrite(PA_CTRL, HIGH);
-    if (!codecport) {
-      codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
-      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
-      codecport->CodecPort_SetMicGain(35);
-    }
-  } else {
+// ================= UNIFIED SCREEN STATE MANAGER =================
+void transitionToScreen(AppScreen newScreen) {
+  previousScreen = currentScreen;
+  currentScreen = newScreen;
+
+  // Cleanup outgoing screen
+  if (previousScreen == SCREEN_CONFIG) {
+    server.close();
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    disableWiFi();
+  } else if (previousScreen == SCREEN_MEETING) {
     if (isRecording) {
       stopMeetingRecording();
     }
     digitalWrite(PA_CTRL, LOW);
   }
 
-  if (scr == SCREEN_CONFIG) {
-    startWiFiConfiguratorAP();
-  } else if (previousScreen == SCREEN_CONFIG) {
-    server.close();
-    dnsServer.stop();
-    WiFi.softAPdisconnect(true);
+  // Setup incoming screen
+  if (currentScreen == SCREEN_CLOCK) {
+    setLowPowerClock(true);
+    drawClockCalendarScreen();
     disableWiFi();
-  }
-
-  if (scr == SCREEN_CLOCK) {
-    setLowPowerClock(true); // Return to 80 MHz low-power mode
+  } else if (currentScreen == SCREEN_MEETING) {
+    setLowPowerClock(false);
+    digitalWrite(PA_CTRL, HIGH);
+    if (!codecport) {
+      codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
+      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
+      codecport->CodecPort_SetMicGain(35);
+    }
+    ensureWiFiConnected(6);
+    disableWiFi();
+    drawMeetingAssistantUI();
+  } else if (currentScreen == SCREEN_CONFIG) {
+    startWiFiConfiguratorAP();
   }
 }
 
+// ================= ARDUINO LIFECYCLE =================
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -1463,82 +1341,52 @@ void setup() {
   analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
 
   RlcdPort.RLCD_Init();
-
   pinMode(PA_CTRL, OUTPUT);
   digitalWrite(PA_CTRL, LOW);
 
   rtc.setBus(I2cbus);
   rtc.begin();
-
   shtc3_read_i2cbus(temp_shtc3, hum_shtc3);
 
   loadSDConfigs();
   cleanOldRecordings();
 
-  // Primary Attempt & Database Fallback during boot
-  bool connected = ensureWiFiConnected(8);
-  if (connected) {
-    strncpy(current_network, WiFi.SSID().c_str(), sizeof(current_network) - 1);
+  // Boot Network Handshake
+  if (ensureWiFiConnected(8)) {
+    safeStrCopy(current_network, WiFi.SSID().c_str(), sizeof(current_network));
     applyLocalizationStrategy();
-    
-    // System boot: Weather Data Trigger (fetches metrics & updates gmt_offset first)
     updateOpenMeteo();
-    lastWeatherSync = millis();
-
-    // System boot: Time Data Trigger (executes with verified gmt_offset)
     syncNTP();
-    strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
-    
-    saveWiFiTxtConfig();
-    saveSDClockConfig();
-    disableWiFi(); // Power down Wi-Fi immediately after initial boot sync
+    safeStrCopy(last_synced_city, city_name, sizeof(last_synced_city));
+    saveAllConfigs();
+    disableWiFi();
   } else {
     lastWeatherSuccess = false;
-    applyLocalizationStrategy(); // Mandatory offline file load
+    applyLocalizationStrategy();
     disableWiFi();
   }
 
-  drawClockCalendarScreen();
+  transitionToScreen(SCREEN_CLOCK);
   lastDrawnMinute = rtc.getMinute();
-  setLowPowerClock(true); // Drop clock speed to 80 MHz for power conservation
 }
 
 void loop() {
-  // 1. Screen Switching Button (GPIO 18 - Left)
+  // 1. Screen Switch Button (GPIO 18 - Left)
   bool reading = digitalRead(BUTTON_PIN);
   if (reading == LOW && lastButtonState == HIGH && (millis() - lastButtonPress > debounceTime)) {
     lastButtonPress = millis();
-    previousScreen = currentScreen;
 
-    // Cycle screens: Screen 3 only appears if Wi-Fi connection check on Screen 2 failed
+    AppScreen nextScreen = SCREEN_CLOCK;
     if (currentScreen == SCREEN_CLOCK) {
-      currentScreen = SCREEN_MEETING;
+      nextScreen = SCREEN_MEETING;
     } else if (currentScreen == SCREEN_MEETING) {
-      if (lastNetworkAvailable) {
-        currentScreen = SCREEN_CLOCK;
-      } else {
-        currentScreen = SCREEN_CONFIG;
-      }
-    } else if (currentScreen == SCREEN_CONFIG) {
-      currentScreen = SCREEN_CLOCK;
+      nextScreen = lastNetworkAvailable ? SCREEN_CLOCK : SCREEN_CONFIG;
     }
-
-    applyScreenPowerMode(currentScreen);
-
-    if (currentScreen == SCREEN_CLOCK) {
-      drawClockCalendarScreen();
-      disableWiFi(); // Disable Wi-Fi after rendering Clock Screen
-      setLowPowerClock(true);
-    } else if (currentScreen == SCREEN_MEETING) {
-      // Check whether a connection can be established and turn off Wi-Fi
-      ensureWiFiConnected(6); // Tests connection, sets lastNetworkAvailable & lastKnownIP
-      disableWiFi();          // Powers down Wi-Fi to keep audio pristine & save power
-      drawMeetingAssistantUI();
-    }
+    transitionToScreen(nextScreen);
   }
   lastButtonState = reading;
 
-  // 2. Right Button (GPIO 0 - BOOT) for Recording Toggle
+  // 2. Meeting Recording Toggle (GPIO 0 - BOOT)
   if (currentScreen == SCREEN_MEETING) {
     bool recBtn = digitalRead(RECORD_BUTTON_PIN);
     if (recBtn == LOW && lastRecButtonState == HIGH && (millis() - lastRecButtonPress > 350)) {
@@ -1551,11 +1399,9 @@ void loop() {
     }
     lastRecButtonState = recBtn;
 
-    // Stream uncompressed 16-bit linear PCM frames to SD card
     if (isRecording) {
       if (codecport) {
         codecport->CodecPort_EchoRead(frame_buffer, AUDIO_FRAME_SIZE);
-
         if (currentMeetingFile) {
           size_t written = fwrite(frame_buffer, 1, AUDIO_FRAME_SIZE, currentMeetingFile);
           if (written < AUDIO_FRAME_SIZE || ferror(currentMeetingFile)) {
@@ -1578,24 +1424,20 @@ void loop() {
     }
   }
 
-  // 3. Screen-Specific & Scheduled Synchronization Routines
+  // 3. Screen 3 Listener
   if (currentScreen == SCREEN_CONFIG) {
     dnsServer.processNextRequest();
     server.handleClient();
 
-    // If a wifi connection is established when in the third screen, then go to first screen
     if (WiFi.status() == WL_CONNECTED) {
       lastKnownIP = WiFi.localIP().toString();
       lastNetworkAvailable = true;
-      saveWiFiTxtConfig();
-      saveSDClockConfig();
-      previousScreen = SCREEN_CONFIG;
-      currentScreen = SCREEN_CLOCK;
-      applyScreenPowerMode(currentScreen);
-      drawClockCalendarScreen();
-      disableWiFi();
+      saveAllConfigs();
+      transitionToScreen(SCREEN_CLOCK);
     }
-  } else {
+  } 
+  // 4. Screen 1 Clock & Periodic Routines
+  else {
     static unsigned long lastRtcCheck = 0;
     unsigned long now = millis();
 
@@ -1605,36 +1447,7 @@ void loop() {
       int curMin = rtc.getMinute();
       int curHour = rtc.getHour();
 
-      // Weather Data Triggers: Minutes :02, :17, :32, and :47 of every hour
-      bool isWeatherMinute = (curMin == 2 || curMin == 17 || curMin == 32 || curMin == 47);
-      if (isWeatherMinute && curMin != lastWeatherSyncMinute) {
-        lastWeatherSyncMinute = curMin;
-        if (!isRecording && currentScreen != SCREEN_CONFIG) {
-          setLowPowerClock(false);
-          if (ensureWiFiConnected(6)) {
-            applyLocalizationStrategy();
-            if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
-              strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
-            }
-            updateOpenMeteo();
-            saveWiFiTxtConfig();
-            saveSDClockConfig();
-            if (currentScreen == SCREEN_CLOCK) {
-              disableWiFi();
-            }
-          } else {
-            if (currentScreen == SCREEN_CLOCK) {
-              disableWiFi();
-            }
-          }
-          if (currentScreen == SCREEN_CLOCK) {
-            setLowPowerClock(true);
-            drawClockCalendarScreen();
-          }
-        }
-      }
-
-      // Time Data Trigger: Daily at 00:00, provided the city parameter has not changed
+      // Daily 00:00 Time Sync
       if (curHour == 0 && curMin == 0) {
         if (!timeSyncedToday) {
           timeSyncedToday = true;
@@ -1642,17 +1455,10 @@ void loop() {
             setLowPowerClock(false);
             if (ensureWiFiConnected(6)) {
               syncNTP();
-              saveWiFiTxtConfig();
-              saveSDClockConfig();
-              if (currentScreen == SCREEN_CLOCK) {
-                disableWiFi();
-              }
-            } else {
-              if (currentScreen == SCREEN_CLOCK) {
-                disableWiFi();
-              }
+              saveAllConfigs();
             }
             if (currentScreen == SCREEN_CLOCK) {
+              disableWiFi();
               setLowPowerClock(true);
             }
           }
@@ -1661,37 +1467,24 @@ void loop() {
         timeSyncedToday = false;
       }
 
-      // Screen 1 Minute Display Tick (Optimized for battery conservation)
+      // Minute Display Tick & Battery-Throttled Weather Sync
       if (currentScreen == SCREEN_CLOCK && curMin != lastDrawnMinute) {
         lastDrawnMinute = curMin;
 
-        // Progressive offline back-off:
-        // Try every minute for the first 3 minutes, then fall back to scheduled sync minutes (:02, :17, :32, :47)
+        bool isWeatherMinute = (curMin % 15 == 2);
         static uint8_t offlineFailures = 0;
-        bool shouldRetry = (!lastNetworkAvailable || !lastWeatherSuccess);
+        bool shouldSync = isWeatherMinute || (!lastNetworkAvailable || !lastWeatherSuccess);
 
-        if (shouldRetry && offlineFailures >= 3) {
-          bool isSyncMinute = (curMin == 2 || curMin == 17 || curMin == 32 || curMin == 47);
-          if (!isSyncMinute) {
-            shouldRetry = false; // Preserve battery power
-          }
+        // After 3 failed minutes, back off to scheduled weather minutes only
+        if (shouldSync && !isWeatherMinute && offlineFailures >= 3) {
+          shouldSync = false;
         }
 
-        if (shouldRetry && !isRecording) {
-          setLowPowerClock(false);
-          if (ensureWiFiConnected(6)) {
-            applyLocalizationStrategy();
-            if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
-              strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
-            }
-            updateOpenMeteo();
-            saveWiFiTxtConfig();
-            saveSDClockConfig();
-            disableWiFi();
-            offlineFailures = 0; // Reset counter on success
-          } else {
-            disableWiFi();
-            if (offlineFailures < 255) offlineFailures++;
+        if (shouldSync && !isRecording) {
+          if (syncWeather()) {
+            offlineFailures = 0;
+          } else if (offlineFailures < 255) {
+            offlineFailures++;
           }
         }
 
@@ -1702,9 +1495,5 @@ void loop() {
   }
 
   // Adaptive delay: 100ms idle delay on Clock Screen saves CPU cycles, 20ms elsewhere
-  if (currentScreen == SCREEN_CLOCK && !isRecording) {
-    delay(100);
-  } else {
-    delay(20);
-  }
+  delay((currentScreen == SCREEN_CLOCK && !isRecording) ? 100 : 20);
 }
