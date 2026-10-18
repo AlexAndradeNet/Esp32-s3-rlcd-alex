@@ -27,6 +27,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "esp_sntp.h"
 
 #include "sdcard_bsp.h"
 
@@ -93,14 +94,15 @@ char mac_server[128] = "http://192.168.1.100:5000";
 char city_name[32] = "Bogota";
 char latitude[16] = "4.7110";
 char longitude[16] = "-74.0721";
+int gmt_offset = -5;
 
 // Network & Localization State Management
 char location_override[16] = "false";
-char timezone_str[64] = "America/Bogota";
 char current_network[64] = "";
 char last_synced_city[32] = "";
 int lastWeatherSyncMinute = -1;
 bool timeSyncedToday = false;
+static volatile bool ntpPacketReceived = false;
 
 // Network State Cache (Displayed while Wi-Fi radio is powered off)
 String lastKnownIP = "No Wi-Fi";
@@ -142,7 +144,7 @@ void saveWiFiTxtConfig();
 bool readWiFiDatabase(DynamicJsonDocument &doc);
 bool saveWiFiDatabase(DynamicJsonDocument &doc);
 bool isInWiFiDatabase(const char* ssid);
-void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, const char* tz);
+void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt);
 void applyLocalizationStrategy();
 bool queryWPSCoordinates(float &lat, float &lon);
 bool queryIPCoordinates(float &lat, float &lon);
@@ -301,7 +303,7 @@ bool isInWiFiDatabase(const char* ssid) {
   return false;
 }
 
-void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, const char* tz) {
+void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt) {
   if (!essid || strlen(essid) == 0) return;
   DynamicJsonDocument doc(8192);
   bool loaded = readWiFiDatabase(doc);
@@ -320,7 +322,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
       obj["city"] = city ? city : "";
       obj["latitude"] = lat;
       obj["longitude"] = lon;
-      obj["timezone"] = tz ? tz : "";
+      obj["gmt"] = gmt;
       exists = true;
       break;
     }
@@ -332,7 +334,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
     entry["city"] = city ? city : "";
     entry["latitude"] = lat;
     entry["longitude"] = lon;
-    entry["timezone"] = tz ? tz : "";
+    entry["gmt"] = gmt;
   }
   saveWiFiDatabase(doc);
 }
@@ -356,17 +358,16 @@ void handleFirstTimeConnection(const char* ssid, const char* pass) {
     dtostrf(lon, 6, 4, longitude);
   }
 
-  // 2. Use coordinates to query the weather and get the time-zone (Open-Meteo returns timezone)
+  // 2. Use coordinates to query the weather and calculate GMT offset from timezone_abbreviation
   updateOpenMeteo();
 
   // 3. Sync the time with NTP using the resolved timezone
-  syncNTP();
 
   // 4. Use BigDataCloud Reverse Geocoding to City API to get the city name
   queryBigDataCloudCity();
   strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
 
-  // 5. Save coordinates, city name, time zone, essid and password in the .txt files and json database
+  // 5. Save coordinates, city name, GMT offset, essid and password in the .txt files and json database
   strncpy(wifi_ssid, ssid, sizeof(wifi_ssid) - 1);
   wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
   strncpy(wifi_pass, pass, sizeof(wifi_pass) - 1);
@@ -374,7 +375,7 @@ void handleFirstTimeConnection(const char* ssid, const char* pass) {
   saveWiFiTxtConfig();
   saveSDClockConfig();
 
-  appendWiFiDatabase(ssid, pass, city_name, (float)atof(latitude), (float)atof(longitude), timezone_str);
+  appendWiFiDatabase(ssid, pass, city_name, (float)atof(latitude), (float)atof(longitude), gmt_offset);
 }
 
 // ================= POWER-SAVING WI-FI MANAGERS =================
@@ -463,7 +464,6 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
 
       // City Change Handling: If city changed, sync time immediately upon connection
       if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
-        syncNTP();
         strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
       }
 
@@ -624,10 +624,9 @@ void loadSDClockConfig() {
             strncpy(longitude, val, sizeof(longitude) - 1);
             longitude[sizeof(longitude) - 1] = '\0';
           }
-        } else if (strcmp(key, "timezone") == 0) {
+        } else if (strcmp(key, "gmt") == 0) {
           if (val && strlen(val) > 0) {
-            strncpy(timezone_str, val, sizeof(timezone_str) - 1);
-            timezone_str[sizeof(timezone_str) - 1] = '\0';
+            gmt_offset = atoi(val);
           }
         } else if (strcmp(key, "override") == 0) {
           if (val && strlen(val) > 0) {
@@ -644,7 +643,7 @@ void loadSDClockConfig() {
 void saveSDClockConfig() {
   FILE *f = fopen("/sdcard/config_clock.txt", "w");
   if (f) {
-    fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ntimezone=%s\noverride=%s\n", city_name, latitude, longitude, timezone_str, location_override);
+    fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\noverride=%s\n", city_name, latitude, longitude, gmt_offset, location_override);
     fclose(f);
   } else {
     sdCardError = true;
@@ -755,9 +754,8 @@ void applyLocalizationStrategy() {
           if (entry.containsKey("longitude") && !entry["longitude"].isNull()) {
             dtostrf(entry["longitude"].as<float>(), 6, 4, longitude);
           }
-          if (entry["timezone"] && strlen(entry["timezone"].as<const char*>()) > 0) {
-            strncpy(timezone_str, entry["timezone"], sizeof(timezone_str) - 1);
-            timezone_str[sizeof(timezone_str) - 1] = '\0';
+          if (entry.containsKey("gmt") && !entry["gmt"].isNull()) {
+            gmt_offset = entry["gmt"].as<int>();
           }
           foundInDb = true;
           break;
@@ -772,15 +770,35 @@ void applyLocalizationStrategy() {
 }
 
 // ================= NTP & WEATHER =================
+void timeSyncNotificationCallback(struct timeval *tv) {
+  ntpPacketReceived = true;
+}
+
 bool syncNTP() {
-  configTzTime(timezone_str, "pool.ntp.org", "time.nist.gov");
-  struct tm ti;
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  ntpPacketReceived = false;
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop();
+  }
+
+  esp_sntp_set_time_sync_notification_cb(timeSyncNotificationCallback);
+  configTime(gmt_offset * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
   int retry = 0;
-  while (!getLocalTime(&ti) && retry < 20) {
-    delay(500);
+  while (!ntpPacketReceived && retry < 25) {
+    delay(400);
     retry++;
   }
-  if (retry >= 20) return false;
+
+  // If no NTP packet arrived over internet, exit without modifying RTC
+  if (!ntpPacketReceived) {
+    return false;
+  }
+
+  struct tm ti;
+  if (!getLocalTime(&ti, 2000)) return false;
+
   rtc.setDate(ti.tm_wday, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
   rtc.setTime(ti.tm_hour, ti.tm_min, ti.tm_sec);
   return true;
@@ -800,10 +818,22 @@ void updateOpenMeteo() {
     DynamicJsonDocument doc(12288);
     deserializeJson(doc, http.getString());
     
-    // Extract timezone
-    if (doc.containsKey("timezone") && !doc["timezone"].isNull()) {
-      strncpy(timezone_str, doc["timezone"], sizeof(timezone_str) - 1);
-      timezone_str[sizeof(timezone_str) - 1] = '\0';
+    // Extract timezone abbreviation and calculate GMT offset
+    if (doc.containsKey("timezone_abbreviation") && !doc["timezone_abbreviation"].isNull()) {
+      const char* tz_abbr = doc["timezone_abbreviation"].as<const char*>();
+      const char* p = strstr(tz_abbr, "GMT");
+      if (p) {
+        gmt_offset = atoi(p + 3);
+      } else {
+        int parsed = atoi(tz_abbr);
+        if (parsed != 0) {
+          gmt_offset = parsed;
+        }
+      }
+    }
+    // Reliable fallback: Open-Meteo always provides exact offset in seconds
+    if (doc.containsKey("utc_offset_seconds")) {
+      gmt_offset = doc["utc_offset_seconds"].as<int>() / 3600;
     }
 
     cur_temp = round(doc["current"]["temperature_2m"].as<float>());
@@ -1302,7 +1332,7 @@ void handleConfigServer() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-      // First-Time Setup: WPS coordinates -> Weather (timezone) -> NTP -> BigDataCloud City -> Save
+      // First-Time Setup: WPS coordinates -> Weather (GMT) -> NTP -> BigDataCloud City -> Save
       handleFirstTimeConnection(wifi_ssid, wifi_pass);
       lastKnownIP = WiFi.localIP().toString();
       lastNetworkAvailable = true;
@@ -1443,13 +1473,14 @@ void setup() {
     strncpy(current_network, WiFi.SSID().c_str(), sizeof(current_network) - 1);
     applyLocalizationStrategy();
     
-    // System boot: Time Data Trigger
+    // System boot: Weather Data Trigger (fetches metrics & updates gmt_offset first)
+    updateOpenMeteo();
+    lastWeatherSync = millis();
+
+    // System boot: Time Data Trigger (executes with verified gmt_offset)
     syncNTP();
     strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
     
-    // System boot: Weather Data Trigger
-    updateOpenMeteo();
-    lastWeatherSync = millis();
     saveWiFiTxtConfig();
     saveSDClockConfig();
     disableWiFi(); // Power down Wi-Fi immediately after initial boot sync
@@ -1543,7 +1574,7 @@ void loop() {
     dnsServer.processNextRequest();
     server.handleClient();
 
-    // If a wifi connection is stablished when in the third screen, then go to first screen
+    // If a wifi connection is established when in the third screen, then go to first screen
     if (WiFi.status() == WL_CONNECTED) {
       lastKnownIP = WiFi.localIP().toString();
       lastNetworkAvailable = true;
