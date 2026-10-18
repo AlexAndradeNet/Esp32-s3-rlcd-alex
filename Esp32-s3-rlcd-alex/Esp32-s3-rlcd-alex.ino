@@ -107,6 +107,7 @@ static volatile bool ntpPacketReceived = false;
 // Network State Cache (Displayed while Wi-Fi radio is powered off)
 String lastKnownIP = "No Wi-Fi";
 bool lastNetworkAvailable = false;
+bool lastWeatherSuccess = false;
 
 // ---------- SENSOR & BATTERY VALUES ----------
 float temp_shtc3 = 0.0, hum_shtc3 = 0.0;
@@ -805,7 +806,10 @@ bool syncNTP() {
 }
 
 void updateOpenMeteo() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    lastWeatherSuccess = false;
+    return;
+  }
   HTTPClient http;
   String url = String("https://api.open-meteo.com/v1/forecast?latitude=") + latitude +
                "&longitude=" + longitude +
@@ -814,7 +818,8 @@ void updateOpenMeteo() {
                "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max" +
                "&timezone=auto";
   http.begin(url);
-  if (http.GET() == 200) {
+  int httpCode = http.GET();
+  if (httpCode == 200) {
     DynamicJsonDocument doc(12288);
     deserializeJson(doc, http.getString());
     
@@ -865,6 +870,9 @@ void updateOpenMeteo() {
         rain_stop_hour = h_idx + 1;
       }
     }
+    lastWeatherSuccess = true;
+  } else {
+    lastWeatherSuccess = false;
   }
   http.end();
 }
@@ -1485,6 +1493,7 @@ void setup() {
     saveSDClockConfig();
     disableWiFi(); // Power down Wi-Fi immediately after initial boot sync
   } else {
+    lastWeatherSuccess = false;
     applyLocalizationStrategy(); // Mandatory offline file load
     disableWiFi();
   }
@@ -1605,7 +1614,6 @@ void loop() {
           if (ensureWiFiConnected(6)) {
             applyLocalizationStrategy();
             if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
-              syncNTP();
               strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
             }
             updateOpenMeteo();
@@ -1653,10 +1661,42 @@ void loop() {
         timeSyncedToday = false;
       }
 
-      // Screen 1 Minute Display Tick
+      // Screen 1 Minute Display Tick (Optimized for battery conservation)
       if (currentScreen == SCREEN_CLOCK && curMin != lastDrawnMinute) {
         lastDrawnMinute = curMin;
+
+        // Progressive offline back-off:
+        // Try every minute for the first 3 minutes, then fall back to scheduled sync minutes (:02, :17, :32, :47)
+        static uint8_t offlineFailures = 0;
+        bool shouldRetry = (!lastNetworkAvailable || !lastWeatherSuccess);
+
+        if (shouldRetry && offlineFailures >= 3) {
+          bool isSyncMinute = (curMin == 2 || curMin == 17 || curMin == 32 || curMin == 47);
+          if (!isSyncMinute) {
+            shouldRetry = false; // Preserve battery power
+          }
+        }
+
+        if (shouldRetry && !isRecording) {
+          setLowPowerClock(false);
+          if (ensureWiFiConnected(6)) {
+            applyLocalizationStrategy();
+            if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
+              strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
+            }
+            updateOpenMeteo();
+            saveWiFiTxtConfig();
+            saveSDClockConfig();
+            disableWiFi();
+            offlineFailures = 0; // Reset counter on success
+          } else {
+            disableWiFi();
+            if (offlineFailures < 255) offlineFailures++;
+          }
+        }
+
         drawClockCalendarScreen();
+        setLowPowerClock(true); // Guarantees 80 MHz sleep state
       }
     }
   }
