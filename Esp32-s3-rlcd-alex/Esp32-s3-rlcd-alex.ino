@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "esp_sntp.h"
+#include "mbedtls/md.h"
 
 #include "sdcard_bsp.h"
 
@@ -122,6 +123,14 @@ int rain_start_hour = -1, rain_stop_hour = -1;
 bool will_rain = false;
 char weather_label[24] = "Fair";
 
+// ---------- DEVICE IDENTITY & AUTH ----------
+char device_id[64] = "";
+char key_id[64] = "";
+char hmac_secret[128] = "";
+char current_recording_id[64] = "";
+unsigned long current_recording_started_at = 0;
+int current_clock_valid = 0;
+
 // ---------- AUDIO RECORDING STATE & SD WATCHDOG ----------
 uint8_t frame_buffer[AUDIO_FRAME_SIZE];
 bool isRecording = false;
@@ -153,6 +162,61 @@ bool obtainCoordinates(float &lat, float &lon);
 bool queryBigDataCloudCity();
 bool syncNTP();
 void updateOpenMeteo();
+
+// ================= CRYPTOGRAPHY & ID GENERATION =================
+String generateUUIDv4() {
+  uint8_t uuid[16];
+  esp_fill_random(uuid, 16);
+  uuid[6] = (uuid[6] & 0x0F) | 0x40; // Version 4
+  uuid[8] = (uuid[8] & 0x3F) | 0x80; // Variant 1
+  char buf[37];
+  snprintf(buf, sizeof(buf), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7],
+           uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+  return String(buf);
+}
+
+String computeFileSHA256(const char* filepath) {
+  FILE *f = fopen(filepath, "rb");
+  if (!f) return "";
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+  mbedtls_md_starts(&ctx);
+  
+  // Heap allocation prevents Stack Overflow on large hashing
+  uint8_t *buf = (uint8_t*)malloc(2048);
+  if (buf) {
+    size_t bytesRead;
+    while ((bytesRead = fread(buf, 1, 2048, f)) > 0) {
+      mbedtls_md_update(&ctx, buf, bytesRead);
+      delay(2); // Keep watchdog alive during big file hashes
+    }
+    free(buf);
+  }
+  
+  fclose(f);
+  uint8_t digest[32];
+  mbedtls_md_finish(&ctx, digest);
+  mbedtls_md_free(&ctx);
+  char hexBuf[65];
+  for (int i = 0; i < 32; i++) sprintf(&hexBuf[i * 2], "%02x", digest[i]);
+  return String(hexBuf);
+}
+
+String computeHMACSHA256(const String& payload, const char* secret) {
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char *)secret, strlen(secret));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char *)payload.c_str(), payload.length());
+  uint8_t hmac[32];
+  mbedtls_md_hmac_finish(&ctx, hmac);
+  mbedtls_md_free(&ctx);
+  char hexBuf[65];
+  for (int i = 0; i < 32; i++) sprintf(&hexBuf[i * 2], "%02x", hmac[i]);
+  return String(hexBuf);
+}
 
 // ================= DYNAMIC CPU POWER SCALING =================
 void setLowPowerClock(bool lowPower) {
@@ -363,6 +427,7 @@ void handleFirstTimeConnection(const char* ssid, const char* pass) {
   updateOpenMeteo();
 
   // 3. Sync the time with NTP using the resolved timezone
+  syncNTP();
 
   // 4. Use BigDataCloud Reverse Geocoding to City API to get the city name
   queryBigDataCloudCity();
@@ -673,10 +738,41 @@ void loadSDConfigs() {
             strncpy(wifi_pass, val, sizeof(wifi_pass) - 1);
             wifi_pass[sizeof(wifi_pass) - 1] = '\0';
           }
-        } else if (strcmp(key, "mac_server") == 0) {
+        }
+      }
+      line = strtok(NULL, "\r\n");
+    }
+  }
+
+  memset(config_buffer, 0, sizeof(config_buffer));
+  if (sdcardPort->SDPort_ReadFile("/sdcard/config_server.txt", (uint8_t *)config_buffer, NULL) == 0) {
+    char *line = strtok(config_buffer, "\r\n");
+    while (line != NULL) {
+      char *eq = strchr(line, '=');
+      if (eq) {
+        *eq = '\0';
+        char *key = line;
+        char *val = eq + 1;
+        // Fix typo handler from client SD
+        if (strcmp(key, "mac_server") == 0) {
           if (val && strlen(val) > 0) {
             strncpy(mac_server, val, sizeof(mac_server) - 1);
             mac_server[sizeof(mac_server) - 1] = '\0';
+          }
+        } else if (strcmp(key, "device_id") == 0) {
+          if (val && strlen(val) > 0) {
+            strncpy(device_id, val, sizeof(device_id) - 1);
+            device_id[sizeof(device_id) - 1] = '\0';
+          }
+        } else if (strcmp(key, "key_id") == 0) {
+          if (val && strlen(val) > 0) {
+            strncpy(key_id, val, sizeof(key_id) - 1);
+            key_id[sizeof(key_id) - 1] = '\0';
+          }
+        } else if (strcmp(key, "hmac_secret") == 0) {
+          if (val && strlen(val) > 0) {
+            strncpy(hmac_secret, val, sizeof(hmac_secret) - 1);
+            hmac_secret[sizeof(hmac_secret) - 1] = '\0';
           }
         }
       }
@@ -823,8 +919,10 @@ void updateOpenMeteo() {
     DynamicJsonDocument doc(12288);
     deserializeJson(doc, http.getString());
     
-    // Extract timezone abbreviation and calculate GMT offset
-    if (doc.containsKey("timezone_abbreviation") && !doc["timezone_abbreviation"].isNull()) {
+    // Reliable fallback: Open-Meteo always provides exact offset in seconds
+    if (doc.containsKey("utc_offset_seconds")) {
+      gmt_offset = doc["utc_offset_seconds"].as<int>() / 3600;
+    } else if (doc.containsKey("timezone_abbreviation") && !doc["timezone_abbreviation"].isNull()) {
       const char* tz_abbr = doc["timezone_abbreviation"].as<const char*>();
       const char* p = strstr(tz_abbr, "GMT");
       if (p) {
@@ -835,10 +933,6 @@ void updateOpenMeteo() {
           gmt_offset = parsed;
         }
       }
-    }
-    // Reliable fallback: Open-Meteo always provides exact offset in seconds
-    if (doc.containsKey("utc_offset_seconds")) {
-      gmt_offset = doc["utc_offset_seconds"].as<int>() / 3600;
     }
 
     cur_temp = round(doc["current"]["temperature_2m"].as<float>());
@@ -1054,12 +1148,12 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 40, &dataSize, 4);
 }
 
-void streamFileToBackend(const char* filepath) {
-  if (WiFi.status() != WL_CONNECTED) return;
+bool streamFileToBackend(const char* filepath) {
+  if (WiFi.status() != WL_CONNECTED) return false;
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
-    return;
+    return false;
   }
 
   fseek(f, 0, SEEK_END);
@@ -1068,59 +1162,125 @@ void streamFileToBackend(const char* filepath) {
 
   String serverStr = String(mac_server);
   serverStr.replace("http://", "");
+  serverStr.replace("https://", "");
   int colonIdx = serverStr.indexOf(':');
   String host = (colonIdx != -1) ? serverStr.substring(0, colonIdx) : serverStr;
-  int port = (colonIdx != -1) ? serverStr.substring(colonIdx + 1).toInt() : 5000;
+  int port = (colonIdx != -1) ? serverStr.substring(colonIdx + 1).toInt() : 8443;
+
+  String content_sha256 = computeFileSHA256(filepath);
+  String request_id = generateUUIDv4();
+  unsigned long request_timestamp = time(NULL);
+
+  // 5-field HMAC Signature matching the backend requirement
+  String canonical = String(device_id) + "\n" +
+                     String(key_id) + "\n" +
+                     String(request_timestamp) + "\n" +
+                     content_sha256 + "\n" +
+                     String(fileSize);
+
+  String signature = computeHMACSHA256(canonical, hmac_secret);
 
   WiFiClient client;
   if (!client.connect(host.c_str(), port)) {
     fclose(f);
-    return;
+    return false;
   }
 
-  String boundary = "----ESP32Boundary7MA4YWxkTrZu0gW";
-  const char *justName = strrchr(filepath, '/');
-  justName = justName ? justName + 1 : filepath;
-
-  String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"" + String(justName) + "\"\r\nContent-Type: audio/wav\r\n\r\n";
-  String tail = "\r\n--" + boundary + "--\r\n";
-  long totalLen = head.length() + fileSize + tail.length();
-
-  client.print("POST /api/transcribe HTTP/1.1\r\n");
+  client.print("POST /api/upload HTTP/1.1\r\n");
   client.print("Host: " + host + "\r\n");
-  client.print("Content-Type: multipart/form-data; boundary=" + boundary + "\r\n");
-  client.print("Content-Length: " + String(totalLen) + "\r\n");
+  client.print("Content-Type: audio/wav\r\n");
+  client.print("Content-Length: " + String(fileSize) + "\r\n");
+  client.print("Expect: 100-continue\r\n");
+  client.print("X-Device-Id: " + String(device_id) + "\r\n");
+  client.print("X-Key-Id: " + String(key_id) + "\r\n");
+  client.print("X-Request-Id: " + request_id + "\r\n");
+  client.print("X-Recording-Id: " + String(current_recording_id) + "\r\n");
+  client.print("X-Recording-Started-At: " + String(current_recording_started_at) + "\r\n");
+  client.print("X-Clock-Valid: " + String(current_clock_valid) + "\r\n");
+  client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
+  client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
+  client.print("X-Signature: " + signature + "\r\n");
   client.print("Connection: close\r\n\r\n");
 
-  client.print(head);
-
-  uint8_t sendBuf[2048];
-  while (fileSize > 0) {
-    size_t toRead = (fileSize > sizeof(sendBuf)) ? sizeof(sendBuf) : fileSize;
-    size_t bytesRead = fread(sendBuf, 1, toRead, f);
-    if (bytesRead > 0) {
-      client.write(sendBuf, bytesRead);
-      fileSize -= bytesRead;
-    } else {
-      break;
+  unsigned long waitStart = millis();
+  bool sendBody = true;
+  String responseHeaders = "";
+  
+  while (millis() - waitStart < 5000) {
+    if (client.available()) {
+      responseHeaders = client.readStringUntil('\n');
+      if (responseHeaders.indexOf("100 Continue") != -1) {
+        while (client.available() && client.readStringUntil('\n') != "\r");
+        sendBody = true;
+        break;
+      } else if (responseHeaders.indexOf("HTTP/") != -1 && responseHeaders.indexOf(" 200") == -1 && responseHeaders.indexOf(" 202") == -1) {
+        sendBody = false;
+        break;
+      }
     }
+    delay(10);
   }
 
-  client.print(tail);
+  if (sendBody) {
+    // Heap allocation prevents Stack Overflow on upload transmission
+    uint8_t *sendBuf = (uint8_t*)malloc(2048);
+    if (sendBuf) {
+      while (fileSize > 0) {
+        size_t toRead = (fileSize > 2048) ? 2048 : fileSize;
+        size_t bytesRead = fread(sendBuf, 1, toRead, f);
+        if (bytesRead > 0) {
+          client.write(sendBuf, bytesRead);
+          fileSize -= bytesRead;
+          delay(2); // Keep watchdog alive explicitly
+        } else {
+          break;
+        }
+      }
+      free(sendBuf);
+    }
+  } else {
+    fclose(f);
+    client.stop();
+    return false;
+  }
+  
   fclose(f);
 
   unsigned long timeout = millis();
+  bool got202 = false;
   while (client.connected() && millis() - timeout < 5000) {
-    if (client.available()) break;
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      // If we don't get a 202 (Accepted), mark it as failed
+      if (line.indexOf("HTTP/") != -1 && line.indexOf(" 202 ") != -1) {
+        got202 = true;
+      }
+    }
     delay(10);
   }
   client.stop();
+  return got202;
 }
 
 void drawMeetingAssistantUI(const char* extraStatus = NULL) {
   canvas.fillScreen(0);
   canvas.setTextColor(1);
   
+  const char* days[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+  char timeHeader[32];
+  sprintf(timeHeader, "%s %02d/%02d %02d:%02d", days[rtc.getWeekday()], rtc.getDay(), rtc.getMonth(), rtc.getHour(), rtc.getMinute());
+
+  canvas.setFont(&FreeSansBold9pt7b);
+  
+  // Calculate text width to right-align
+  int16_t tx1, ty1;
+  uint16_t tw, th;
+  canvas.getTextBounds(timeHeader, 0, 0, &tx1, &ty1, &tw, &th);
+  int timeX = W - tw - 20; // W=400, leaves 20px padding on the right edge
+  
+  canvas.setCursor(timeX, 20);
+  canvas.print(timeHeader);
+
   canvas.setFont(&FreeSansBold12pt7b);
   canvas.setCursor(20, 45);
   canvas.print("Meeting Assistant");
@@ -1226,6 +1386,11 @@ void startMeetingRecording() {
     return;
   }
 
+  strncpy(current_recording_id, generateUUIDv4().c_str(), sizeof(current_recording_id) - 1);
+  current_recording_id[sizeof(current_recording_id) - 1] = '\0';
+  current_recording_started_at = time(NULL); 
+  current_clock_valid = (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) ? 1 : 0;
+
   totalRecordedBytes = 0;
   recordingStartTime = millis();
   isRecording = true;
@@ -1262,8 +1427,12 @@ void stopMeetingRecording() {
 
   if (connected) {
     drawMeetingAssistantUI("Syncing to Mac...");
-    streamFileToBackend(currentMeetingFileName);
-    drawMeetingAssistantUI("Saved & Transmitted!");
+    bool success = streamFileToBackend(currentMeetingFileName);
+    if (success) {
+      drawMeetingAssistantUI("Saved & Transmitted!");
+    } else {
+      drawMeetingAssistantUI("Upload Failed (No 202)");
+    }
     disableWiFi(); // Immediately shut down Wi-Fi after transmission concludes
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
@@ -1661,42 +1830,45 @@ void loop() {
         timeSyncedToday = false;
       }
 
-      // Screen 1 Minute Display Tick (Optimized for battery conservation)
-      if (currentScreen == SCREEN_CLOCK && curMin != lastDrawnMinute) {
+      // Minute Display Tick (Optimized for battery conservation)
+      if (curMin != lastDrawnMinute) {
         lastDrawnMinute = curMin;
 
-        // Progressive offline back-off:
-        // Try every minute for the first 3 minutes, then fall back to scheduled sync minutes (:02, :17, :32, :47)
-        static uint8_t offlineFailures = 0;
-        bool shouldRetry = (!lastNetworkAvailable || !lastWeatherSuccess);
+        if (currentScreen == SCREEN_CLOCK) {
+          // Progressive offline back-off:
+          // Try every minute for the first 3 minutes, then fall back to scheduled sync minutes (:02, :17, :32, :47)
+          static uint8_t offlineFailures = 0;
+          bool shouldRetry = (!lastNetworkAvailable || !lastWeatherSuccess);
 
-        if (shouldRetry && offlineFailures >= 3) {
-          bool isSyncMinute = (curMin == 2 || curMin == 17 || curMin == 32 || curMin == 47);
-          if (!isSyncMinute) {
-            shouldRetry = false; // Preserve battery power
-          }
-        }
-
-        if (shouldRetry && !isRecording) {
-          setLowPowerClock(false);
-          if (ensureWiFiConnected(6)) {
-            applyLocalizationStrategy();
-            if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
-              strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
+          if (shouldRetry && offlineFailures >= 3) {
+            bool isSyncMinute = (curMin == 2 || curMin == 17 || curMin == 32 || curMin == 47);
+            if (!isSyncMinute) {
+              shouldRetry = false; // Preserve battery power
             }
-            updateOpenMeteo();
-            saveWiFiTxtConfig();
-            saveSDClockConfig();
-            disableWiFi();
-            offlineFailures = 0; // Reset counter on success
-          } else {
-            disableWiFi();
-            if (offlineFailures < 255) offlineFailures++;
           }
-        }
 
-        drawClockCalendarScreen();
-        setLowPowerClock(true); // Guarantees 80 MHz sleep state
+          if (shouldRetry && !isRecording) {
+            setLowPowerClock(false);
+            if (ensureWiFiConnected(6)) {
+              applyLocalizationStrategy();
+              if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
+                strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
+              }
+              updateOpenMeteo();
+              saveWiFiTxtConfig();
+              saveSDClockConfig();
+              disableWiFi();
+              offlineFailures = 0; // Reset counter on success
+            } else {
+              disableWiFi();
+              if (offlineFailures < 255) offlineFailures++;
+            }
+          }
+          drawClockCalendarScreen();
+          setLowPowerClock(true); // Guarantees 80 MHz sleep state
+        } else if (currentScreen == SCREEN_MEETING && !isRecording) {
+          drawMeetingAssistantUI(); // Updates the clock on the Meeting screen
+        }
       }
     }
   }

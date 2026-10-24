@@ -119,3 +119,8 @@ playground.xcworkspace
 # Project
 config_clock.txt
 config_wifi.txt
+config_server.txt
+.env
+venv
+audio
+*.db
