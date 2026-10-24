@@ -185,10 +185,10 @@ String computeFileSHA256(const char* filepath) {
   mbedtls_md_starts(&ctx);
   
   // Heap allocation prevents Stack Overflow on large hashing
-  uint8_t *buf = (uint8_t*)malloc(2048);
+  uint8_t *buf = (uint8_t*)malloc(AUDIO_FRAME_SIZE);
   if (buf) {
     size_t bytesRead;
-    while ((bytesRead = fread(buf, 1, 2048, f)) > 0) {
+    while ((bytesRead = fread(buf, 1, AUDIO_FRAME_SIZE, f)) > 0) {
       mbedtls_md_update(&ctx, buf, bytesRead);
       delay(2); // Keep watchdog alive during big file hashes
     }
@@ -1148,9 +1148,9 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
 
   uint32_t subChunk1Size = 16;
   uint16_t audioFormat = 7;                                      // 7 = WAVE_FORMAT_MULAW (G.711 compression)
-  uint16_t numChannels = CHANNELS;                               // 1 (Mono)
-  uint32_t sampleRate = SAMPLE_RATE;                             // 16000 Hz
-  uint16_t blockAlign = CHANNELS * 1;                            // 1 byte per sample (8-bit)
+  uint16_t numChannels = CHANNELS;                               // Uses global
+  uint32_t sampleRate = SAMPLE_RATE;                             // Uses global
+  uint16_t blockAlign = CHANNELS * 1;                            // 1 byte per sample (8-bit compressed)
   uint32_t byteRate = sampleRate * blockAlign;                   // 16000 bytes/sec
   uint16_t bitsPerSample = 8;                                    // Compressed 8-bit
 
@@ -1168,9 +1168,17 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
 
 bool streamFileToBackend(const char* filepath) {
   if (WiFi.status() != WL_CONNECTED) return false;
+  
+  // Disable power save to prevent dropped packets, but lower TX power 
+  // to 8.5dBm to prevent 3.3V rail brownouts during SD card reads.
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
+    WiFi.setSleep(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     return false;
   }
 
@@ -1199,8 +1207,12 @@ bool streamFileToBackend(const char* filepath) {
   String signature = computeHMACSHA256(canonical, hmac_secret);
 
   WiFiClient client;
+  client.setTimeout(30000); 
+
   if (!client.connect(host.c_str(), port)) {
     fclose(f);
+    WiFi.setSleep(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     return false;
   }
 
@@ -1240,18 +1252,36 @@ bool streamFileToBackend(const char* filepath) {
   }
 
   if (sendBody) {
-    // Heap allocation prevents Stack Overflow on upload transmission
-    uint8_t *sendBuf = (uint8_t*)malloc(2048);
+    uint8_t *sendBuf = (uint8_t*)malloc(AUDIO_FRAME_SIZE); // Uses global AUDIO_FRAME_SIZE
     if (sendBuf) {
-      while (fileSize > 0) {
-        size_t toRead = (fileSize > 2048) ? 2048 : fileSize;
+      size_t remaining = fileSize;
+      while (remaining > 0) {
+        size_t toRead = (remaining > AUDIO_FRAME_SIZE) ? AUDIO_FRAME_SIZE : remaining;
         size_t bytesRead = fread(sendBuf, 1, toRead, f);
+        
         if (bytesRead > 0) {
-          client.write(sendBuf, bytesRead);
-          fileSize -= bytesRead;
-          delay(2); // Keep watchdog alive explicitly
+          // Robust retry loop for Wi-Fi buffer congestion
+          size_t written = 0;
+          int retries = 0;
+          while (written < bytesRead && retries < 20) {
+            size_t res = client.write(sendBuf + written, bytesRead - written);
+            if (res > 0) {
+              written += res;
+              retries = 0; // Reset retries on successful write
+            } else {
+              retries++;
+              delay(50); // Yield to LwIP network stack to free TX buffers
+            }
+          }
+          
+          if (written < bytesRead) {
+            break; // Hard disconnect after 1 full second of failure, exit cleanly
+          }
+          
+          remaining -= bytesRead;
+          delay(2); // Keep watchdog alive
         } else {
-          break;
+          break; // File read error
         }
       }
       free(sendBuf);
@@ -1259,6 +1289,8 @@ bool streamFileToBackend(const char* filepath) {
   } else {
     fclose(f);
     client.stop();
+    WiFi.setSleep(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     return false;
   }
   
@@ -1269,7 +1301,6 @@ bool streamFileToBackend(const char* filepath) {
   while (client.connected() && millis() - timeout < 5000) {
     if (client.available()) {
       String line = client.readStringUntil('\n');
-      // If we don't get a 202 (Accepted), mark it as failed
       if (line.indexOf("HTTP/") != -1 && line.indexOf(" 202 ") != -1) {
         got202 = true;
       }
@@ -1277,6 +1308,11 @@ bool streamFileToBackend(const char* filepath) {
     delay(10);
   }
   client.stop();
+  
+  // Re-enable power save mode and restore maximum TX power
+  WiFi.setSleep(true); 
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  
   return got202;
 }
 
@@ -1615,7 +1651,7 @@ void applyScreenPowerMode(AppScreen scr) {
     digitalWrite(PA_CTRL, HIGH);
     if (!codecport) {
       codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
-      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
+      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE); // Uses global BITS_PER_SAMPLE
       codecport->CodecPort_SetMicGain(35);
     }
   } else {
@@ -1728,7 +1764,7 @@ void loop() {
   // 2. Right Button (GPIO 0 - BOOT) for Recording Toggle
   if (currentScreen == SCREEN_MEETING) {
     bool recBtn = digitalRead(RECORD_BUTTON_PIN);
-    if (recBtn == LOW && lastRecButtonState == HIGH && (millis() - lastRecButtonPress > 350)) {
+    if (recBtn == LOW && lastRecButtonState == HIGH && (millis() - lastRecButtonPress > debounceTime)) { // Uses global debounceTime
       lastRecButtonPress = millis();
       if (!isRecording) {
         startMeetingRecording();
