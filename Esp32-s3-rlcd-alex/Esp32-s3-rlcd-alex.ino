@@ -1122,6 +1122,24 @@ void drawClockCalendarScreen() {
 }
 
 // ================= SCREEN 2: MEETING ASSISTANT (16-BIT PCM WAV) =================
+
+// Fast 16-bit PCM to 8-bit G.711 Mu-law compressor
+inline uint8_t pcm16_to_ulaw(int16_t pcm_val) {
+  const int16_t BIAS = 0x84;
+  const int16_t CLIP = 32635;
+  int16_t sign = (pcm_val >> 8) & 0x80;
+  if (sign != 0) pcm_val = -pcm_val;
+  if (pcm_val > CLIP) pcm_val = CLIP;
+  pcm_val = (pcm_val + BIAS) >> 2;
+
+  int16_t exponent = 7;
+  for (int16_t expMask = 0x4000; (pcm_val & expMask) == 0 && exponent > 0; expMask >>= 1) {
+    exponent--;
+  }
+  int16_t mantissa = (pcm_val >> (exponent + 3)) & 0x0F;
+  return ~(uint8_t)(sign | (exponent << 4) | mantissa);
+}
+
 void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer, "RIFF", 4);
   uint32_t chunkSize = dataSize + 36;
@@ -1129,12 +1147,12 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 8, "WAVEfmt ", 8);
 
   uint32_t subChunk1Size = 16;
-  uint16_t audioFormat = 1;                                      // 1 = WAVE_FORMAT_PCM (Uncompressed 16-bit linear)
+  uint16_t audioFormat = 7;                                      // 7 = WAVE_FORMAT_MULAW (G.711 compression)
   uint16_t numChannels = CHANNELS;                               // 1 (Mono)
   uint32_t sampleRate = SAMPLE_RATE;                             // 16000 Hz
-  uint16_t blockAlign = CHANNELS * (BITS_PER_SAMPLE / 8);        // 2 bytes per sample
-  uint32_t byteRate = sampleRate * blockAlign;                   // 32000 bytes/sec
-  uint16_t bitsPerSample = BITS_PER_SAMPLE;                      // 16-bit PCM
+  uint16_t blockAlign = CHANNELS * 1;                            // 1 byte per sample (8-bit)
+  uint32_t byteRate = sampleRate * blockAlign;                   // 16000 bytes/sec
+  uint16_t bitsPerSample = 8;                                    // Compressed 8-bit
 
   memcpy(buffer + 16, &subChunk1Size, 4);
   memcpy(buffer + 20, &audioFormat, 2);
@@ -1726,8 +1744,15 @@ void loop() {
         codecport->CodecPort_EchoRead(frame_buffer, AUDIO_FRAME_SIZE);
 
         if (currentMeetingFile) {
-          size_t written = fwrite(frame_buffer, 1, AUDIO_FRAME_SIZE, currentMeetingFile);
-          if (written < AUDIO_FRAME_SIZE || ferror(currentMeetingFile)) {
+          // Convert 16-bit PCM to 8-bit ulaw in-place
+          int num_samples = AUDIO_FRAME_SIZE / 2;
+          int16_t* pcm_samples = (int16_t*)frame_buffer;
+          for (int i = 0; i < num_samples; i++) {
+            frame_buffer[i] = pcm16_to_ulaw(pcm_samples[i]);
+          }
+
+          size_t written = fwrite(frame_buffer, 1, num_samples, currentMeetingFile);
+          if (written < num_samples || ferror(currentMeetingFile)) {
             sdCardError = true;
             isRecording = false;
             fclose(currentMeetingFile);
