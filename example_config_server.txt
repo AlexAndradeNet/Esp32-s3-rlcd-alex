@@ -1,0 +1,4 @@
+mac_server=http://192.168.1.100:8443
+device_id=secret_device_id
+key_id=primary-key-01
+hmac_secret=super-secret-pre-shared-key-replace-me
