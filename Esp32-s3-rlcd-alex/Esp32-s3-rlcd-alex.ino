@@ -3,6 +3,7 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include "display_bsp.h"
 #include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "font.h"
 #include "secfont.h"
 #include "qrcode.h"
@@ -60,6 +61,7 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 static I2cMasterBus I2cbus(I2C_SCL, I2C_SDA, 0);
 CodecPort *codecport = NULL;
+bool codecActive = false; // True while ES8311/ES7210 and I2S are open (Screen 2 only)
 PCF85063A rtc;
 
 CustomSDPort *sdcardPort = NULL;
@@ -1719,12 +1721,24 @@ void applyScreenPowerMode(AppScreen scr) {
       codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
       codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE); // Uses global BITS_PER_SAMPLE
       codecport->CodecPort_SetMicGain(35);
+      codecActive = true;
+    } else if (!codecActive) {
+      // Re-open the codec devices that were put in standby when leaving Screen 2
+      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
+      codecport->CodecPort_SetMicGain(35);
+      codecActive = true;
     }
   } else {
     if (isRecording) {
       stopMeetingRecording();
     }
     digitalWrite(PA_CTRL, LOW);
+    if (codecport && codecActive) {
+      // Put ES8311/ES7210 in standby and stop the I2S clocks while away from Screen 2
+      codecport->CodecPort_CloseMic();
+      codecport->CodecPort_CloseSpeaker();
+      codecActive = false;
+    }
   }
 
   if (scr == SCREEN_CONFIG) {
@@ -1739,6 +1753,35 @@ void applyScreenPowerMode(AppScreen scr) {
   if (scr == SCREEN_CLOCK) {
     setLowPowerClock(true); // Return to 80 MHz low-power mode
   }
+}
+
+// Light sleep until the next minute rollover (RTC) or a press of the screen cycle button.
+// RAM, peripherals and GPIO levels are retained, so the RLCD keeps its image and loop() resumes in place.
+void enterClockLightSleep() {
+  // Skip while the button is held, otherwise the low-level wakeup would fire immediately
+  if (digitalRead(BUTTON_PIN) == LOW) return;
+
+  int sec = rtc.getSecond();
+  if (sec < 0 || sec > 59) sec = 0;
+  uint64_t sleepUs = (uint64_t)(60 - sec) * 1000000ULL + 200000ULL; // Wake 200ms after the minute changes
+
+  // Keep display, I2C, amplifier and button pins in their active configuration during sleep
+  const gpio_num_t keepPins[] = {GPIO_NUM_12, GPIO_NUM_11, GPIO_NUM_5, GPIO_NUM_40, GPIO_NUM_41,
+                                 (gpio_num_t)I2C_SDA, (gpio_num_t)I2C_SCL, (gpio_num_t)PA_CTRL,
+                                 (gpio_num_t)BUTTON_PIN};
+  for (gpio_num_t pin : keepPins) {
+    gpio_sleep_sel_dis(pin);
+  }
+
+  esp_sleep_enable_timer_wakeup(sleepUs);
+  gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  Serial.flush();
+  esp_light_sleep_start();
+
+  gpio_wakeup_disable((gpio_num_t)BUTTON_PIN);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
 }
 
 void setup() {
@@ -2003,6 +2046,7 @@ void loop() {
   // Adaptive delay: 100ms idle delay on Clock Screen saves CPU cycles, 20ms elsewhere
   if (currentScreen == SCREEN_CLOCK && !isRecording) {
     delay(100);
+    enterClockLightSleep(); // Screen 1: sleep between minute ticks instead of polling
   } else {
     delay(20);
   }
