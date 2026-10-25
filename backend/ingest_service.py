@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
-from db import init_db, get_db_connection, STAGING_DIR, AUDIO_DIR
+from db import init_db, recover_on_startup, get_db_connection, get_current_transcript, STAGING_DIR, AUDIO_DIR
 
 load_dotenv()
 app = Flask("IngestService")
@@ -199,11 +199,17 @@ def process_background_tasks():
                 
                 conn = get_db_connection()
                 try:
-                    conn.execute("""
+                    cursor = conn.cursor()
+                    cursor.execute("""
                         INSERT INTO transcripts (job_id, asr_runtime, asr_model, text)
                         VALUES (?, ?, ?, ?)
                     """, (job_id, "mlx-whisper", whisper_model_path, transcript_text))
-                    conn.execute("UPDATE meetings SET state = 'TRANSCRIBED' WHERE job_id = ?", (job_id,))
+                    # Older transcripts stay for audit; every read goes through current_transcript_id
+                    cursor.execute("""
+                        UPDATE meetings
+                        SET state = 'TRANSCRIBED', current_transcript_id = ?, transcribed_at = CURRENT_TIMESTAMP
+                        WHERE job_id = ?
+                    """, (cursor.lastrowid, job_id))
                     conn.commit()
                     print(f"[WORKER] Transcription complete for job {job_id}.")
                 finally:
@@ -219,15 +225,17 @@ def process_background_tasks():
         conn = get_db_connection()
         transcribed_job = None
         transcript_text = None
+        transcript_id = None
         try:
             transcribed_job = conn.execute("SELECT job_id FROM meetings WHERE state = 'TRANSCRIBED' LIMIT 1").fetchone()
             if transcribed_job:
                 job_id = transcribed_job["job_id"]
                 conn.execute("UPDATE meetings SET state = 'EXTRACTING' WHERE job_id = ?", (job_id,))
                 conn.commit()
-                transcript_row = conn.execute("SELECT text FROM transcripts WHERE job_id = ?", (job_id,)).fetchone()
+                transcript_row = get_current_transcript(conn, job_id)
                 if transcript_row:
                     transcript_text = transcript_row["text"]
+                    transcript_id = transcript_row["transcript_id"]
                 else:
                     conn.execute("UPDATE meetings SET state = 'FAILED_EXTRACTION', last_error_message = 'Missing transcript' WHERE job_id = ?", (job_id,))
                     conn.commit()
@@ -254,14 +262,14 @@ def process_background_tasks():
                 try:
                     cursor = conn.cursor()
                     cursor.execute("""
-                        INSERT INTO extractions (job_id, model, summary, raw_json)
-                        VALUES (?, ?, ?, ?)
-                    """, (job_id, "mlx-llm", summary, json.dumps({"summary": summary})))
-                    
+                        INSERT INTO extractions (job_id, transcript_id, model, summary, raw_json)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (job_id, transcript_id, "mlx-llm", summary, json.dumps({"summary": summary})))
+
                     extraction_id = cursor.lastrowid
                     cursor.execute("""
-                        UPDATE meetings 
-                        SET state = 'COMPLETED', current_extraction_id = ? 
+                        UPDATE meetings
+                        SET state = 'COMPLETED', current_extraction_id = ?, completed_at = CURRENT_TIMESTAMP
                         WHERE job_id = ?
                     """, (extraction_id, job_id))
                     conn.commit()
@@ -281,6 +289,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest Service")
     parser.add_argument("--debug", action="store_true", help="Enable Flask debug mode")
     args = parser.parse_args()
+
+    # Recovery must finish before the worker claims jobs and before any upload arrives
+    recover_on_startup()
 
     # Start the Apple MLX summarization thread
     worker_thread = threading.Thread(target=process_background_tasks, daemon=True)

@@ -231,6 +231,19 @@ def get_db_connection():
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
+def get_current_transcript(conn, job_id):
+    """Returns the transcript the meeting points to. Rows created before current_transcript_id
+    was maintained fall back to the newest transcript of the job."""
+    return conn.execute("""
+        SELECT t.transcript_id, t.text
+        FROM transcripts t
+        JOIN meetings m ON m.job_id = t.job_id
+        WHERE t.job_id = ?
+          AND (m.current_transcript_id IS NULL OR t.transcript_id = m.current_transcript_id)
+        ORDER BY t.transcript_id DESC
+        LIMIT 1
+    """, (job_id,)).fetchone()
+
 def register_env_device(cursor):
     """Reads .env variables and registers the ESP32 device if not already present."""
     device_id = os.getenv("ESP32_UUID")
@@ -288,5 +301,53 @@ def init_db():
     # 4. Automatically seed the environment device
     register_env_device(cursor)
     conn.commit()
-                
+
     conn.close()
+
+def recover_on_startup():
+    """Restores a consistent disk/DB state after a crash. Must run before the worker and the ingest listener start."""
+    init_directories()
+
+    # 1. No upload survives a restart: delete partial staging files
+    for name in os.listdir(STAGING_DIR):
+        os.remove(os.path.join(STAGING_DIR, name))
+        print(f"[RECOVERY] Deleted staging file {name}")
+
+    conn = get_db_connection()
+    try:
+        # 2. Orphan sweep: audio files without a meetings row are moved aside, never deleted
+        known_paths = {
+            os.path.normpath(row["audio_relpath"])
+            for row in conn.execute("SELECT audio_relpath FROM meetings WHERE audio_relpath IS NOT NULL")
+        }
+        for root, dirs, files in os.walk(AUDIO_DIR):
+            if os.path.normpath(root).startswith(os.path.normpath(ORPHANS_DIR)):
+                continue
+            for name in files:
+                path = os.path.normpath(os.path.join(root, name))
+                if name.endswith(".wav") and path not in known_paths:
+                    os.rename(path, os.path.join(ORPHANS_DIR, name))
+                    print(f"[RECOVERY] Moved orphan audio {path} to {ORPHANS_DIR}")
+
+        # 3. Missing-audio check: queued work whose file is gone can never be transcribed
+        for row in conn.execute("SELECT job_id, audio_relpath FROM meetings WHERE state IN ('QUEUED', 'TRANSCRIBING')").fetchall():
+            if not row["audio_relpath"] or not os.path.exists(row["audio_relpath"]):
+                conn.execute("""
+                    UPDATE meetings
+                    SET state = 'FAILED_ASR', last_error_code = 'audio_missing',
+                        last_error_message = 'Audio file not found at startup', last_error_at = CURRENT_TIMESTAMP
+                    WHERE job_id = ?
+                """, (row["job_id"],))
+                print(f"[RECOVERY] Job {row['job_id']} marked FAILED_ASR (audio_missing)")
+
+        # 4. Return in-flight jobs: this process hosts the only worker, so nothing else holds them
+        cur = conn.execute("UPDATE meetings SET state = 'QUEUED' WHERE state = 'TRANSCRIBING'")
+        if cur.rowcount:
+            print(f"[RECOVERY] Returned {cur.rowcount} TRANSCRIBING job(s) to QUEUED")
+        cur = conn.execute("UPDATE meetings SET state = 'TRANSCRIBED' WHERE state = 'EXTRACTING'")
+        if cur.rowcount:
+            print(f"[RECOVERY] Returned {cur.rowcount} EXTRACTING job(s) to TRANSCRIBED")
+
+        conn.commit()
+    finally:
+        conn.close()

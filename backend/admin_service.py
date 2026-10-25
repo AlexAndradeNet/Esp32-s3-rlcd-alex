@@ -3,7 +3,7 @@ import argparse
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, send_file
 from dotenv import load_dotenv
-from db import init_db, get_db_connection
+from db import init_db, get_db_connection, get_current_transcript
 
 load_dotenv()
 app = Flask("AdminService")
@@ -116,7 +116,7 @@ def get_meeting(job_id):
         spk_rows = conn.execute("SELECT * FROM speakers WHERE extraction_id = ?", (meeting["current_extraction_id"],)).fetchall()
         speakers = [dict(s) for s in spk_rows]
 
-    transcript_row = conn.execute("SELECT text FROM transcripts WHERE job_id = ?", (job_id,)).fetchone()
+    transcript_row = get_current_transcript(conn, job_id)
     transcript = transcript_row["text"] if transcript_row else None
 
     conn.close()
