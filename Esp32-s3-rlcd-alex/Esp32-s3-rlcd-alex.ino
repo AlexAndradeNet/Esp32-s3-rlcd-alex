@@ -152,8 +152,8 @@ bool isLeapYear(int yr) {
 void loadSDClockConfig();
 void saveSDClockConfig();
 void saveWiFiTxtConfig();
-bool readWiFiDatabase(DynamicJsonDocument &doc);
-bool saveWiFiDatabase(DynamicJsonDocument &doc);
+bool readWiFiDatabase(JsonDocument &doc);
+bool saveWiFiDatabase(JsonDocument &doc);
 bool isInWiFiDatabase(const char* ssid);
 void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt);
 void applyLocalizationStrategy();
@@ -245,9 +245,9 @@ bool queryWPSCoordinates(float &lat, float &lon) {
     http.begin(url);
     int httpCode = http.GET();
     if (httpCode == 200) {
-      DynamicJsonDocument doc(1024);
+      JsonDocument doc;
       if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-        if (doc["result"] == 200 && doc["data"].containsKey("lat") && doc["data"].containsKey("lon")) {
+        if (doc["result"] == 200 && !doc["data"]["lat"].isNull() && !doc["data"]["lon"].isNull()) {
           lat = doc["data"]["lat"].as<float>();
           lon = doc["data"]["lon"].as<float>();
           http.end();
@@ -266,9 +266,9 @@ bool queryIPCoordinates(float &lat, float &lon) {
   http.begin("http://ip-api.com/json/");
   int httpCode = http.GET();
   if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-      if (doc.containsKey("lat") && doc.containsKey("lon")) {
+      if (!doc["lat"].isNull() && !doc["lon"].isNull()) {
         lat = doc["lat"].as<float>();
         lon = doc["lon"].as<float>();
         http.end();
@@ -300,7 +300,7 @@ bool queryBigDataCloudCity() {
   http.begin(url);
   int httpCode = http.GET();
   if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
       const char* city = doc["city"];
       const char* locality = doc["locality"];
@@ -320,7 +320,7 @@ bool queryBigDataCloudCity() {
 }
 
 // ================= DATABASE PERSISTENCE =================
-bool readWiFiDatabase(DynamicJsonDocument &doc) {
+bool readWiFiDatabase(JsonDocument &doc) {
   FILE *f = fopen("/sdcard/wifi_database.json", "r");
   if (!f) return false;
   fseek(f, 0, SEEK_END);
@@ -343,7 +343,7 @@ bool readWiFiDatabase(DynamicJsonDocument &doc) {
   return (err == DeserializationError::Ok);
 }
 
-bool saveWiFiDatabase(DynamicJsonDocument &doc) {
+bool saveWiFiDatabase(JsonDocument &doc) {
   FILE *f = fopen("/sdcard/wifi_database.json", "w");
   if (!f) {
     return false;
@@ -360,10 +360,10 @@ bool saveWiFiDatabase(DynamicJsonDocument &doc) {
 
 bool isInWiFiDatabase(const char* ssid) {
   if (!ssid || strlen(ssid) == 0) return false;
-  DynamicJsonDocument doc(8192);
+  JsonDocument doc;
   if (!readWiFiDatabase(doc) || !doc.is<JsonArray>()) return false;
   for (JsonObject entry : doc.as<JsonArray>()) {
-    if (entry["essid"] && strcmp(entry["essid"], ssid) == 0) {
+    if (entry["essid"] == ssid) {
       return true;
     }
   }
@@ -372,7 +372,7 @@ bool isInWiFiDatabase(const char* ssid) {
 
 void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt) {
   if (!essid || strlen(essid) == 0) return;
-  DynamicJsonDocument doc(8192);
+  JsonDocument doc;
   bool loaded = readWiFiDatabase(doc);
   JsonArray arr;
   if (loaded && doc.is<JsonArray>()) {
@@ -384,7 +384,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
 
   bool exists = false;
   for (JsonObject obj : arr) {
-    if (obj["essid"] && strcmp(obj["essid"], essid) == 0) {
+    if (obj["essid"] == essid) {
       obj["password"] = pass ? pass : "";
       obj["city"] = city ? city : "";
       obj["latitude"] = lat;
@@ -395,7 +395,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
     }
   }
   if (!exists) {
-    JsonObject entry = arr.createNestedObject();
+    JsonObject entry = arr.add<JsonObject>();
     entry["essid"] = essid;
     entry["password"] = pass ? pass : "";
     entry["city"] = city ? city : "";
@@ -478,7 +478,7 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
     delay(200);
     int n = WiFi.scanNetworks();
     if (n > 0) {
-      DynamicJsonDocument dbDoc(8192);
+      JsonDocument dbDoc;
       if (readWiFiDatabase(dbDoc) && dbDoc.is<JsonArray>()) {
         JsonArray arr = dbDoc.as<JsonArray>();
         for (int i = 0; i < n && !connected; i++) {
@@ -837,23 +837,24 @@ void applyLocalizationStrategy() {
   } else {
     // If override=false or empty: Read location details from wifi_database.json associated with active network
     String currentSSID = WiFi.SSID();
-    DynamicJsonDocument doc(8192);
+    JsonDocument doc;
     bool foundInDb = false;
 
     if (readWiFiDatabase(doc) && doc.is<JsonArray>()) {
       for (JsonObject entry : doc.as<JsonArray>()) {
-        if (entry["essid"] && currentSSID == entry["essid"].as<const char*>()) {
-          if (entry["city"] && strlen(entry["city"].as<const char*>()) > 0) {
-            strncpy(city_name, entry["city"], sizeof(city_name) - 1);
+        if (entry["essid"] == currentSSID.c_str()) {
+          const char* db_city = entry["city"].as<const char*>(); // nullptr unless the value is a string
+          if (db_city && strlen(db_city) > 0) {
+            strncpy(city_name, db_city, sizeof(city_name) - 1);
             city_name[sizeof(city_name) - 1] = '\0';
           }
-          if (entry.containsKey("latitude") && !entry["latitude"].isNull()) {
+          if (!entry["latitude"].isNull()) {
             dtostrf(entry["latitude"].as<float>(), 6, 4, latitude);
           }
-          if (entry.containsKey("longitude") && !entry["longitude"].isNull()) {
+          if (!entry["longitude"].isNull()) {
             dtostrf(entry["longitude"].as<float>(), 6, 4, longitude);
           }
-          if (entry.containsKey("gmt") && !entry["gmt"].isNull()) {
+          if (!entry["gmt"].isNull()) {
             gmt_offset = entry["gmt"].as<int>();
           }
           foundInDb = true;
@@ -918,13 +919,13 @@ void updateOpenMeteo() {
   http.begin(url);
   int httpCode = http.GET();
   if (httpCode == 200) {
-    DynamicJsonDocument doc(12288);
+    JsonDocument doc;
     deserializeJson(doc, http.getString());
     
     // Reliable fallback: Open-Meteo always provides exact offset in seconds
-    if (doc.containsKey("utc_offset_seconds")) {
+    if (!doc["utc_offset_seconds"].isNull()) {
       gmt_offset = doc["utc_offset_seconds"].as<int>() / 3600;
-    } else if (doc.containsKey("timezone_abbreviation") && !doc["timezone_abbreviation"].isNull()) {
+    } else if (!doc["timezone_abbreviation"].isNull()) {
       const char* tz_abbr = doc["timezone_abbreviation"].as<const char*>();
       const char* p = strstr(tz_abbr, "GMT");
       if (p) {
