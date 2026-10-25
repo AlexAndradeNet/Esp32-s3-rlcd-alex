@@ -1925,6 +1925,7 @@ void enterRecordingQuietMode() {
   }
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF); // Unconditional: disableWiFi() keeps the radio on for Screen 3
+  btStop();            // No-op today (Bluetooth never runs); guarantees no BLE radio during recording
   silenceSpeaker();
   shtc3_sleep();
 }
@@ -2004,6 +2005,10 @@ void enterClockLightSleep() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  // Bluetooth is never used. The core already skips starting it and frees its memory at boot
+  // (no BT library is linked); this keeps the controller off even if a future library starts it.
+  btStop();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(RECORD_BUTTON_PIN, INPUT_PULLUP);
