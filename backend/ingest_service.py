@@ -11,7 +11,7 @@ from functools import wraps
 from flask import Flask, request, jsonify
 from werkzeug.serving import WSGIRequestHandler
 from dotenv import load_dotenv
-from db import init_db, recover_on_startup, get_db_connection, get_current_transcript, STAGING_DIR, AUDIO_DIR
+from db import init_db, recover_on_startup, get_db_connection, get_current_transcript, STAGING_DIR, AUDIO_DIR, ORPHANS_DIR
 
 load_dotenv()
 app = Flask("IngestService")
@@ -198,8 +198,10 @@ def upload_audio():
     except Exception as e:
         print(f"[UPLOAD ERROR] Database insertion failed: {e}")
         conn.close()
+        # Stored audio is never deleted: this file passed the digest check, so park it for manual recovery
         if os.path.exists(final_path):
-            os.remove(final_path)
+            os.rename(final_path, os.path.join(ORPHANS_DIR, os.path.basename(final_path)))
+            print(f"[UPLOAD] Moved unregistered audio to {ORPHANS_DIR}: {os.path.basename(final_path)}")
         return jsonify({"error_code": "internal", "message": f"Database insertion failed: {str(e)}"}), 500
 
     conn.close()

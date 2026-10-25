@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DB_PATH = "meeting_companion.db"
+# Storage policy: accepted audio under AUDIO_DIR (including orphans) is never deleted by the services.
+# Unregistered files are moved to ORPHANS_DIR instead. Only partial uploads in STAGING_DIR are removed.
 AUDIO_DIR = "audio"
 STAGING_DIR = "staging"
 ORPHANS_DIR = os.path.join(AUDIO_DIR, "orphans")
