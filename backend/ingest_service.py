@@ -46,6 +46,16 @@ def send_100_continue_if_expected():
     if sock:
         sock.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
 
+def parse_recording_id(device_id, header_value, recording_timestamp):
+    """The device sends the stable UUIDv4 stored in each recording's filename. Older
+    filenames carry no ID, so fall back to the legacy device_id + start-time identity."""
+    if header_value:
+        try:
+            return str(uuid.UUID(header_value))
+        except ValueError:
+            return None
+    return f"{device_id}_{recording_timestamp}"
+
 def require_device_hmac(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -112,16 +122,26 @@ def upload_audio():
     if not recording_timestamp:
         return jsonify({"error_code": "bad_request", "message": "Missing X-Recording-Started-At header"}), 400
 
-    recording_id = f"{device_id}_{recording_timestamp}"
-    
+    recording_id = parse_recording_id(device_id, request.headers.get("X-Recording-Id"), recording_timestamp)
+    if not recording_id:
+        return jsonify({"error_code": "invalid_headers", "message": "X-Recording-Id must be a UUID"}), 400
+
+    clock_valid = 1 if request.headers.get("X-Clock-Valid") == "1" else 0
+    client_sha256 = request.headers.get("X-Content-SHA256", "").lower()
+
     # Check deduplication quickly and immediately close connection
     conn = get_db_connection()
-    existing_job = conn.execute("SELECT * FROM meetings WHERE recording_id = ?", (recording_id,)).fetchone()
+    existing_job = conn.execute(
+        "SELECT * FROM meetings WHERE device_id = ? AND recording_id = ?", (device_id, recording_id)
+    ).fetchone()
     conn.close()
-    
+
     if existing_job:
         state = existing_job["state"]
         job_id = existing_job["job_id"]
+        if client_sha256 and existing_job["audio_sha256"] and client_sha256 != existing_job["audio_sha256"]:
+            print(f"[UPLOAD] Recording conflict for {recording_id}: digest differs from job {job_id}")
+            return jsonify({"error_code": "recording_conflict", "job_id": job_id, "message": "A different file was already uploaded under this recording_id"}), 409
         if state in ["COMPLETED"]:
             conn = get_db_connection()
             ext_row = conn.execute("SELECT raw_json FROM extractions WHERE extraction_id = ?", (existing_job["current_extraction_id"],)).fetchone()
@@ -129,7 +149,7 @@ def upload_audio():
             payload = json.loads(ext_row["raw_json"]) if ext_row and ext_row["raw_json"] else {}
             return jsonify({"job_id": job_id, "status": "processed", "data": payload}), 200
         elif state in ["FAILED_ASR", "FAILED_EXTRACTION"]:
-            return jsonify({"job_id": job_id, "status": state, "duplicate": True, "error_code": existing_job["last_error_code"]}), 409
+            return jsonify({"job_id": job_id, "status": state, "duplicate": True, "error_code": "duplicate", "last_error_code": existing_job["last_error_code"]}), 409
         else:
             return jsonify({"job_id": job_id, "status": state, "duplicate": True}), 202
 
@@ -156,7 +176,6 @@ def upload_audio():
         return jsonify({"error_code": "internal", "message": f"Error reading stream: {str(e)}"}), 500
 
     computed_sha256 = hasher.hexdigest()
-    client_sha256 = request.headers.get("X-Content-SHA256", "").lower()
 
     if client_sha256 and computed_sha256 != client_sha256:
         print(f"[UPLOAD ERROR] Hash mismatch. Expected {computed_sha256}, got {client_sha256}")
@@ -175,9 +194,9 @@ def upload_audio():
     conn = get_db_connection()
     try:
         conn.execute("""
-            INSERT INTO meetings (job_id, device_id, recording_id, recording_started_at, uploaded_at, audio_relpath, audio_sha256, audio_bytes, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED')
-        """, (job_id, device_id, recording_id, recording_timestamp, uploaded_at, final_path, computed_sha256, audio_bytes))
+            INSERT INTO meetings (job_id, device_id, recording_id, recording_started_at, clock_valid, uploaded_at, audio_relpath, audio_sha256, audio_bytes, state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED')
+        """, (job_id, device_id, recording_id, recording_timestamp, clock_valid, uploaded_at, final_path, computed_sha256, audio_bytes))
         conn.commit()
     except Exception as e:
         print(f"[UPLOAD ERROR] Database insertion failed: {e}")
