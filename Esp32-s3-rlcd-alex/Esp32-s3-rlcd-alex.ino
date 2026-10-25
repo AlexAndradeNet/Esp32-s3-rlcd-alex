@@ -172,6 +172,7 @@ bool queryBigDataCloudCity();
 bool syncNTP();
 void updateOpenMeteo();
 void processFailedUploads();
+void writeWavHeader(uint8_t* buffer, uint32_t dataSize);
 
 // ================= CRYPTOGRAPHY & ID GENERATION =================
 String generateUUIDv4() {
@@ -819,6 +820,7 @@ bool parseRecordingIdentity(const String &wavPath, String &recordingId, int &clo
   return true;
 }
 
+// Only uploaded (_OK) recordings expire. Failed, pending and rejected files are unsent data and stay until handled.
 void cleanOldRecordings() {
   DIR *dir = opendir("/sdcard/meetings");
   if (!dir) {
@@ -834,11 +836,11 @@ void cleanOldRecordings() {
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     String fname = String(entry->d_name);
-    if (fname.endsWith(".wav") && fname.length() >= 19) {
+    if (fname.endsWith("_OK.wav") && fname.length() >= 19) {
       struct tm ftime;
       memset(&ftime, 0, sizeof(ftime));
       int yr, mon, dy, hr, mn, sc;
-      if (sscanf(fname.c_str(), "%4d%2d%2d_%2d%2d%2d.wav", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
+      if (sscanf(fname.c_str(), "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
         ftime.tm_year = yr - 1900;
         ftime.tm_mon  = mon - 1;
         ftime.tm_mday = dy;
@@ -846,14 +848,51 @@ void cleanOldRecordings() {
         ftime.tm_min  = mn;
         ftime.tm_sec  = sc;
         time_t f_epoch = mktime(&ftime);
-        if (difftime(now, f_epoch) > 172800) { 
-          String fullPath = String("/sdcard/meetings/") + fname;
-          unlink(fullPath.c_str());
+        if (difftime(now, f_epoch) > 172800) {
+          unlink((String("/sdcard/meetings/") + fname).c_str());
         }
       }
     }
   }
   closedir(dir);
+}
+
+// A crash or power loss mid-recording leaves a _pending file whose header is still 44 zero bytes.
+// Rewrite the header from the file size and queue it as _failed so it gets uploaded.
+void recoverPendingRecordings() {
+  DIR *dir = opendir("/sdcard/meetings");
+  if (!dir) return;
+
+  std::vector<String> pending;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    String fname = String(entry->d_name);
+    if (fname.endsWith("_pending.wav")) pending.push_back(String("/sdcard/meetings/") + fname);
+  }
+  closedir(dir);
+
+  for (const String &path : pending) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) continue;
+    if (st.st_size <= 44) {
+      unlink(path.c_str()); // Nothing was recorded
+      continue;
+    }
+    FILE *f = fopen(path.c_str(), "r+b");
+    if (!f) {
+      sdCardError = true;
+      continue;
+    }
+    uint8_t header[44];
+    writeWavHeader(header, (uint32_t)(st.st_size - 44));
+    bool ok = (fwrite(header, 1, 44, f) == 44);
+    fclose(f);
+    if (!ok) {
+      sdCardError = true;
+      continue;
+    }
+    rename(path.c_str(), withRecordingStatus(path, "failed").c_str());
+  }
 }
 
 // ================= LOCALIZATION STRATEGY =================
@@ -1928,6 +1967,7 @@ void setup() {
   loadSDConfigs();
   seedSystemClockFromRTC();   // Needs gmt_offset from config_clock.txt; before anything reads time(NULL)
   cleanOldRecordings();
+  recoverPendingRecordings(); // Repair files cut off by a crash or power loss and queue them as _failed
 
   // Primary Attempt & Database Fallback during boot
   bool connected = ensureWiFiConnected(8);
