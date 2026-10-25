@@ -143,11 +143,8 @@ def upload_audio():
             print(f"[UPLOAD] Recording conflict for {recording_id}: digest differs from job {job_id}")
             return jsonify({"error_code": "recording_conflict", "job_id": job_id, "message": "A different file was already uploaded under this recording_id"}), 409
         if state in ["COMPLETED"]:
-            conn = get_db_connection()
-            ext_row = conn.execute("SELECT raw_json FROM extractions WHERE extraction_id = ?", (existing_job["current_extraction_id"],)).fetchone()
-            conn.close()
-            payload = json.loads(ext_row["raw_json"]) if ext_row and ext_row["raw_json"] else {}
-            return jsonify({"job_id": job_id, "status": "processed", "data": payload}), 200
+            # No meeting content here: the device only needs to know the server has the file
+            return jsonify({"job_id": job_id, "status": state, "duplicate": True}), 200
         elif state in ["FAILED_ASR", "FAILED_EXTRACTION"]:
             return jsonify({"job_id": job_id, "status": state, "duplicate": True, "error_code": "duplicate", "last_error_code": existing_job["last_error_code"]}), 409
         else:
