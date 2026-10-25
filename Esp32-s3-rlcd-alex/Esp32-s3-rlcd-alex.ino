@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include "esp_sntp.h"
 #include "mbedtls/md.h"
+#include <sys/time.h>
 
 #include "sdcard_bsp.h"
 
@@ -105,6 +106,7 @@ char last_synced_city[32] = "";
 int lastWeatherSyncMinute = -1;
 bool timeSyncedToday = false;
 static volatile bool ntpPacketReceived = false;
+bool clockSyncedSinceBoot = false; // Set only by a confirmed NTP sync; esp_sntp_get_sync_status() resets after each read
 
 // Network State Cache (Displayed while Wi-Fi radio is powered off)
 String lastKnownIP = "No Wi-Fi";
@@ -901,7 +903,36 @@ bool syncNTP() {
 
   rtc.setDate(ti.tm_wday, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
   rtc.setTime(ti.tm_hour, ti.tm_min, ti.tm_sec);
+  clockSyncedSinceBoot = true;
   return true;
+}
+
+// The RTC holds local time; mktime() needs TZ to convert it (and WAV filenames) to UTC epochs.
+// POSIX TZ signs are inverted: GMT-5 is "UTC+5".
+void applyTimezone() {
+  char tz[16];
+  snprintf(tz, sizeof(tz), "UTC%+d", -gmt_offset);
+  setenv("TZ", tz, 1);
+  tzset();
+}
+
+// SNTP is the only thing that sets the system clock. Without this, an offline boot leaves
+// time(NULL) near 1970 and every signed upload fails with 401 clock_skew.
+void seedSystemClockFromRTC() {
+  applyTimezone();
+  int yr = rtc.getYear();
+  if (yr < 2024) return; // RTC never set; leave the system clock alone
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_year = yr - 1900;
+  t.tm_mon  = rtc.getMonth() - 1;
+  t.tm_mday = rtc.getDay();
+  t.tm_hour = rtc.getHour();
+  t.tm_min  = rtc.getMinute();
+  t.tm_sec  = rtc.getSecond();
+  t.tm_isdst = 0;
+  struct timeval tv = { .tv_sec = mktime(&t), .tv_usec = 0 };
+  settimeofday(&tv, NULL);
 }
 
 void updateOpenMeteo() {
@@ -1805,6 +1836,7 @@ void setup() {
   shtc3_read_i2cbus(temp_shtc3, hum_shtc3);
 
   loadSDConfigs();
+  seedSystemClockFromRTC();   // Needs gmt_offset from config_clock.txt; before anything reads time(NULL)
   cleanOldRecordings();
 
   // Primary Attempt & Database Fallback during boot
