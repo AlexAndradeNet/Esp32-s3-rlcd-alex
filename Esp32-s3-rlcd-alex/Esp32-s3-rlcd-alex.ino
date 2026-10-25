@@ -459,6 +459,9 @@ void handleFirstTimeConnection(const char* ssid, const char* pass) {
 
 // ================= POWER-SAVING WI-FI MANAGERS =================
 bool ensureWiFiConnected(int maxWaitSec = 6) {
+  // The radio stays off for the whole recording; uploads start only after isRecording is cleared
+  if (isRecording) return false;
+
   setLowPowerClock(false);
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -581,6 +584,7 @@ void disableWiFi() {
 
 // ================= BATTERY LOGIC =================
 void readBattery() {
+  if (isRecording) return; // Keep the last value; no ADC sampling while recording
   int raw = analogRead(BAT_ADC_PIN);
   float v_adc = (raw / 4095.0f) * 3.3f;
   v_bat = v_adc * 3.0f * 1.079f;
@@ -618,40 +622,47 @@ uint8_t crc8(const uint8_t *data, int len) {
   return crc;
 }
 
+bool shtc3_attach() {
+  if (shtc3_dev_handle != NULL) return true;
+  i2c_device_config_t dev_cfg = {
+    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+    .device_address = SHTC3_ADDR,
+    .scl_speed_hz = 100000,
+  };
+  return i2c_master_bus_add_device(I2cbus.user_i2c_handle, &dev_cfg, &shtc3_dev_handle) == ESP_OK;
+}
+
+void shtc3_sleep() {
+  if (!shtc3_attach()) return;
+  uint8_t cmd_sleep[2] = {0xB0, 0x98};
+  i2c_master_transmit(shtc3_dev_handle, cmd_sleep, 2, 50);
+}
+
 bool shtc3_read_i2cbus(float &tempC, float &rh) {
-  if (shtc3_dev_handle == NULL) {
-    i2c_device_config_t dev_cfg = {
-      .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-      .device_address = SHTC3_ADDR,
-      .scl_speed_hz = 100000,
-    };
-    if (i2c_master_bus_add_device(I2cbus.user_i2c_handle, &dev_cfg, &shtc3_dev_handle) != ESP_OK) {
-      return false;
-    }
-  }
+  if (isRecording) return false; // Sensors stay idle while recording
+  if (!shtc3_attach()) return false;
 
   uint8_t cmd_wake[2] = {0x35, 0x17};
   if (i2c_master_transmit(shtc3_dev_handle, cmd_wake, 2, 50) != ESP_OK) return false;
   delay(1);
 
+  // From here on the sensor is awake: every exit path sends it back to sleep
+  bool ok = false;
   uint8_t cmd_meas[2] = {0x78, 0x66};
-  if (i2c_master_transmit(shtc3_dev_handle, cmd_meas, 2, 50) != ESP_OK) return false;
-  delay(20);
-
   uint8_t d[6] = {0};
-  if (i2c_master_receive(shtc3_dev_handle, d, 6, 50) != ESP_OK) return false;
-
-  if (crc8(&d[0], 2) != d[2]) return false;
-  if (crc8(&d[3], 2) != d[5]) return false;
+  if (i2c_master_transmit(shtc3_dev_handle, cmd_meas, 2, 50) == ESP_OK) {
+    delay(20);
+    ok = (i2c_master_receive(shtc3_dev_handle, d, 6, 50) == ESP_OK) &&
+         crc8(&d[0], 2) == d[2] && crc8(&d[3], 2) == d[5];
+  }
+  shtc3_sleep();
+  if (!ok) return false;
 
   uint16_t tRaw  = (uint16_t)d[0] << 8 | d[1];
   uint16_t rhRaw = (uint16_t)d[3] << 8 | d[4];
 
   tempC = -45.0f + 175.0f * (float)tRaw / 65535.0f;
   rh    = 100.0f * (float)rhRaw / 65535.0f;
-
-  uint8_t cmd_sleep[2] = {0xB0, 0x98};
-  i2c_master_transmit(shtc3_dev_handle, cmd_sleep, 2, 50);
 
   return true;
 }
@@ -1684,6 +1695,7 @@ void startMeetingRecording() {
     return;
   }
 
+  enterRecordingQuietMode(); // Radio, NTP, speaker and sensors off before the first audio frame
 
   totalRecordedBytes = 0;
   recordingStartTime = millis();
@@ -1891,10 +1903,35 @@ void startWiFiConfiguratorAP() {
 }
 
 // ================= POWER & DISPATCH =================
+// Powers down the ES8311 DAC and its amplifier while keeping the ES7210 microphones running.
+// Both codecs share one full-duplex I2S port: while the mic (RX) is open, esp_codec_dev only marks
+// the TX disable as pending, so the mic clocks keep running; CodecPort_CloseMic() later stops both.
+// The speaker is opened together with the mic on purpose: opening only the mic would leave the TX
+// channel enabled from init_codec(), and the I2S clocks would never stop on the other screens.
+// The ES8311 driver also owns the amplifier pin (pa: 46 in board_cfg.h) and lowers it on close.
+void silenceSpeaker() {
+  if (codecport && codecActive) {
+    codecport->CodecPort_CloseSpeaker();
+  }
+  digitalWrite(PA_CTRL, LOW);
+}
+
+// Recording captures only the microphones: no RF bursts or network activity, no speaker hiss or
+// feedback, no sensor I2C traffic. Called when a recording starts; every path below also refuses
+// to wake these up while isRecording is set.
+void enterRecordingQuietMode() {
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop(); // No periodic NTP retries in the background
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF); // Unconditional: disableWiFi() keeps the radio on for Screen 3
+  silenceSpeaker();
+  shtc3_sleep();
+}
+
 void applyScreenPowerMode(AppScreen scr) {
   if (scr == SCREEN_MEETING) {
     setLowPowerClock(false); // Boost CPU for 16 kHz I2S audio reading
-    digitalWrite(PA_CTRL, HIGH);
     if (!codecport) {
       codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
       codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE); // Uses global BITS_PER_SAMPLE
@@ -1906,13 +1943,15 @@ void applyScreenPowerMode(AppScreen scr) {
       codecport->CodecPort_SetMicGain(35);
       codecActive = true;
     }
+    silenceSpeaker(); // Nothing is ever played: only the microphone path stays powered on Screen 2
   } else {
     if (isRecording) {
       stopMeetingRecording();
     }
     digitalWrite(PA_CTRL, LOW);
     if (codecport && codecActive) {
-      // Put ES8311/ES7210 in standby and stop the I2S clocks while away from Screen 2
+      // Put ES8311/ES7210 in standby and stop the I2S clocks while away from Screen 2.
+      // Mic first: closing RX also applies the TX disable left pending by silenceSpeaker().
       codecport->CodecPort_CloseMic();
       codecport->CodecPort_CloseSpeaker();
       codecActive = false;
