@@ -124,3 +124,4 @@ config_server.txt
 venv
 audio
 *.db
+__pycache__/

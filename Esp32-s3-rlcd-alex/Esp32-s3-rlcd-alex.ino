@@ -3,8 +3,8 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include "display_bsp.h"
 #include "esp_sleep.h"
+#include "driver/gpio.h"
 #include "font.h"
-#include "secfont.h"
 #include "qrcode.h"
 
 // Expose internal handle for SHTC3 ESP-IDF calls
@@ -29,6 +29,8 @@
 #include <unistd.h>
 #include "esp_sntp.h"
 #include "mbedtls/md.h"
+#include <sys/time.h>
+#include <vector>
 
 #include "sdcard_bsp.h"
 
@@ -60,6 +62,7 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 static I2cMasterBus I2cbus(I2C_SCL, I2C_SDA, 0);
 CodecPort *codecport = NULL;
+bool codecActive = false; // True while ES8311/ES7210 and I2S are open (Screen 2 only)
 PCF85063A rtc;
 
 CustomSDPort *sdcardPort = NULL;
@@ -104,6 +107,8 @@ char last_synced_city[32] = "";
 int lastWeatherSyncMinute = -1;
 bool timeSyncedToday = false;
 static volatile bool ntpPacketReceived = false;
+bool clockSyncedSinceBoot = false; // Set only by a confirmed NTP sync; esp_sntp_get_sync_status() resets after each read
+int rtc_gmt_offset = 0;            // UTC offset the RTC's local time was last written with (and the active TZ)
 
 // Network State Cache (Displayed while Wi-Fi radio is powered off)
 String lastKnownIP = "No Wi-Fi";
@@ -127,16 +132,21 @@ char weather_label[24] = "Fair";
 char device_id[64] = "";
 char key_id[64] = "";
 char hmac_secret[128] = "";
-char current_recording_id[64] = "";
-unsigned long current_recording_started_at = 0;
-int current_clock_valid = 0;
+
+// ---------- UPLOAD OUTCOMES ----------
+enum UploadResult {
+  UPLOAD_OK = 0,        // 200/202, or 409 duplicate: the server has the file
+  UPLOAD_RETRY_LATER,   // Network error, timeout, 408, 429, 5xx, 507, hash mismatch
+  UPLOAD_CLOCK_SKEW,    // 401 clock_skew: resync NTP, then retry
+  UPLOAD_REJECTED       // Other 4xx or recording_conflict: keep the file, never retry
+};
 
 // ---------- AUDIO RECORDING STATE & SD WATCHDOG ----------
 uint8_t frame_buffer[AUDIO_FRAME_SIZE];
 bool isRecording = false;
 bool sdCardError = false; // Flagged if 0x107 or write failure occurs
 FILE *currentMeetingFile = NULL;
-char currentMeetingFileName[64] = "";
+char currentMeetingFileName[128] = ""; // ~85 chars: /sdcard/meetings/ + timestamp + UUID + clock flag + status
 uint32_t totalRecordedBytes = 0;
 unsigned long recordingStartTime = 0;
 unsigned long lastTimerScreenUpdate = 0;
@@ -151,8 +161,8 @@ bool isLeapYear(int yr) {
 void loadSDClockConfig();
 void saveSDClockConfig();
 void saveWiFiTxtConfig();
-bool readWiFiDatabase(DynamicJsonDocument &doc);
-bool saveWiFiDatabase(DynamicJsonDocument &doc);
+bool readWiFiDatabase(JsonDocument &doc);
+bool saveWiFiDatabase(JsonDocument &doc);
 bool isInWiFiDatabase(const char* ssid);
 void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt);
 void applyLocalizationStrategy();
@@ -163,6 +173,8 @@ bool queryBigDataCloudCity();
 bool syncNTP();
 void updateOpenMeteo();
 void processFailedUploads();
+void resyncClockIfOffsetChanged();
+void writeWavHeader(uint8_t* buffer, uint32_t dataSize);
 
 // ================= CRYPTOGRAPHY & ID GENERATION =================
 String generateUUIDv4() {
@@ -244,9 +256,9 @@ bool queryWPSCoordinates(float &lat, float &lon) {
     http.begin(url);
     int httpCode = http.GET();
     if (httpCode == 200) {
-      DynamicJsonDocument doc(1024);
+      JsonDocument doc;
       if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-        if (doc["result"] == 200 && doc["data"].containsKey("lat") && doc["data"].containsKey("lon")) {
+        if (doc["result"] == 200 && !doc["data"]["lat"].isNull() && !doc["data"]["lon"].isNull()) {
           lat = doc["data"]["lat"].as<float>();
           lon = doc["data"]["lon"].as<float>();
           http.end();
@@ -265,9 +277,9 @@ bool queryIPCoordinates(float &lat, float &lon) {
   http.begin("http://ip-api.com/json/");
   int httpCode = http.GET();
   if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-      if (doc.containsKey("lat") && doc.containsKey("lon")) {
+      if (!doc["lat"].isNull() && !doc["lon"].isNull()) {
         lat = doc["lat"].as<float>();
         lon = doc["lon"].as<float>();
         http.end();
@@ -299,7 +311,7 @@ bool queryBigDataCloudCity() {
   http.begin(url);
   int httpCode = http.GET();
   if (httpCode == 200) {
-    DynamicJsonDocument doc(2048);
+    JsonDocument doc;
     if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
       const char* city = doc["city"];
       const char* locality = doc["locality"];
@@ -319,7 +331,7 @@ bool queryBigDataCloudCity() {
 }
 
 // ================= DATABASE PERSISTENCE =================
-bool readWiFiDatabase(DynamicJsonDocument &doc) {
+bool readWiFiDatabase(JsonDocument &doc) {
   FILE *f = fopen("/sdcard/wifi_database.json", "r");
   if (!f) return false;
   fseek(f, 0, SEEK_END);
@@ -342,7 +354,7 @@ bool readWiFiDatabase(DynamicJsonDocument &doc) {
   return (err == DeserializationError::Ok);
 }
 
-bool saveWiFiDatabase(DynamicJsonDocument &doc) {
+bool saveWiFiDatabase(JsonDocument &doc) {
   FILE *f = fopen("/sdcard/wifi_database.json", "w");
   if (!f) {
     return false;
@@ -359,10 +371,10 @@ bool saveWiFiDatabase(DynamicJsonDocument &doc) {
 
 bool isInWiFiDatabase(const char* ssid) {
   if (!ssid || strlen(ssid) == 0) return false;
-  DynamicJsonDocument doc(8192);
+  JsonDocument doc;
   if (!readWiFiDatabase(doc) || !doc.is<JsonArray>()) return false;
   for (JsonObject entry : doc.as<JsonArray>()) {
-    if (entry["essid"] && strcmp(entry["essid"], ssid) == 0) {
+    if (entry["essid"] == ssid) {
       return true;
     }
   }
@@ -371,7 +383,7 @@ bool isInWiFiDatabase(const char* ssid) {
 
 void appendWiFiDatabase(const char* essid, const char* pass, const char* city, float lat, float lon, int gmt) {
   if (!essid || strlen(essid) == 0) return;
-  DynamicJsonDocument doc(8192);
+  JsonDocument doc;
   bool loaded = readWiFiDatabase(doc);
   JsonArray arr;
   if (loaded && doc.is<JsonArray>()) {
@@ -383,7 +395,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
 
   bool exists = false;
   for (JsonObject obj : arr) {
-    if (obj["essid"] && strcmp(obj["essid"], essid) == 0) {
+    if (obj["essid"] == essid) {
       obj["password"] = pass ? pass : "";
       obj["city"] = city ? city : "";
       obj["latitude"] = lat;
@@ -394,7 +406,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
     }
   }
   if (!exists) {
-    JsonObject entry = arr.createNestedObject();
+    JsonObject entry = arr.add<JsonObject>();
     entry["essid"] = essid;
     entry["password"] = pass ? pass : "";
     entry["city"] = city ? city : "";
@@ -408,7 +420,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
 void saveWiFiTxtConfig() {
   FILE *f = fopen("/sdcard/config_wifi.txt", "w");
   if (f) {
-    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", wifi_ssid, wifi_pass, mac_server);
+    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\n", wifi_ssid, wifi_pass);
     fclose(f);
   } else {
     sdCardError = true;
@@ -447,6 +459,9 @@ void handleFirstTimeConnection(const char* ssid, const char* pass) {
 
 // ================= POWER-SAVING WI-FI MANAGERS =================
 bool ensureWiFiConnected(int maxWaitSec = 6) {
+  // The radio stays off for the whole recording; uploads start only after isRecording is cleared
+  if (isRecording) return false;
+
   setLowPowerClock(false);
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -477,7 +492,7 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
     delay(200);
     int n = WiFi.scanNetworks();
     if (n > 0) {
-      DynamicJsonDocument dbDoc(8192);
+      JsonDocument dbDoc;
       if (readWiFiDatabase(dbDoc) && dbDoc.is<JsonArray>()) {
         JsonArray arr = dbDoc.as<JsonArray>();
         for (int i = 0; i < n && !connected; i++) {
@@ -529,7 +544,7 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
 
       applyLocalizationStrategy();
 
-      // City Change Handling: If city changed, sync time immediately upon connection
+      // City Change Handling: track the city; the time resync below is driven by the UTC offset
       if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
         strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
       }
@@ -538,6 +553,9 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
       if (netChanged) {
         updateOpenMeteo();
       }
+
+      // A new city or an Open-Meteo correction may have changed the offset: sync time immediately
+      resyncClockIfOffsetChanged();
     } else {
       if (activeSSID.length() > 0) {
         strncpy(current_network, activeSSID.c_str(), sizeof(current_network) - 1);
@@ -566,6 +584,7 @@ void disableWiFi() {
 
 // ================= BATTERY LOGIC =================
 void readBattery() {
+  if (isRecording) return; // Keep the last value; no ADC sampling while recording
   int raw = analogRead(BAT_ADC_PIN);
   float v_adc = (raw / 4095.0f) * 3.3f;
   v_bat = v_adc * 3.0f * 1.079f;
@@ -603,40 +622,47 @@ uint8_t crc8(const uint8_t *data, int len) {
   return crc;
 }
 
+bool shtc3_attach() {
+  if (shtc3_dev_handle != NULL) return true;
+  i2c_device_config_t dev_cfg = {
+    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+    .device_address = SHTC3_ADDR,
+    .scl_speed_hz = 100000,
+  };
+  return i2c_master_bus_add_device(I2cbus.user_i2c_handle, &dev_cfg, &shtc3_dev_handle) == ESP_OK;
+}
+
+void shtc3_sleep() {
+  if (!shtc3_attach()) return;
+  uint8_t cmd_sleep[2] = {0xB0, 0x98};
+  i2c_master_transmit(shtc3_dev_handle, cmd_sleep, 2, 50);
+}
+
 bool shtc3_read_i2cbus(float &tempC, float &rh) {
-  if (shtc3_dev_handle == NULL) {
-    i2c_device_config_t dev_cfg = {
-      .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-      .device_address = SHTC3_ADDR,
-      .scl_speed_hz = 100000,
-    };
-    if (i2c_master_bus_add_device(I2cbus.user_i2c_handle, &dev_cfg, &shtc3_dev_handle) != ESP_OK) {
-      return false;
-    }
-  }
+  if (isRecording) return false; // Sensors stay idle while recording
+  if (!shtc3_attach()) return false;
 
   uint8_t cmd_wake[2] = {0x35, 0x17};
   if (i2c_master_transmit(shtc3_dev_handle, cmd_wake, 2, 50) != ESP_OK) return false;
   delay(1);
 
+  // From here on the sensor is awake: every exit path sends it back to sleep
+  bool ok = false;
   uint8_t cmd_meas[2] = {0x78, 0x66};
-  if (i2c_master_transmit(shtc3_dev_handle, cmd_meas, 2, 50) != ESP_OK) return false;
-  delay(20);
-
   uint8_t d[6] = {0};
-  if (i2c_master_receive(shtc3_dev_handle, d, 6, 50) != ESP_OK) return false;
-
-  if (crc8(&d[0], 2) != d[2]) return false;
-  if (crc8(&d[3], 2) != d[5]) return false;
+  if (i2c_master_transmit(shtc3_dev_handle, cmd_meas, 2, 50) == ESP_OK) {
+    delay(20);
+    ok = (i2c_master_receive(shtc3_dev_handle, d, 6, 50) == ESP_OK) &&
+         crc8(&d[0], 2) == d[2] && crc8(&d[3], 2) == d[5];
+  }
+  shtc3_sleep();
+  if (!ok) return false;
 
   uint16_t tRaw  = (uint16_t)d[0] << 8 | d[1];
   uint16_t rhRaw = (uint16_t)d[3] << 8 | d[4];
 
   tempC = -45.0f + 175.0f * (float)tRaw / 65535.0f;
   rh    = 100.0f * (float)rhRaw / 65535.0f;
-
-  uint8_t cmd_sleep[2] = {0xB0, 0x98};
-  i2c_master_transmit(shtc3_dev_handle, cmd_sleep, 2, 50);
 
   return true;
 }
@@ -784,6 +810,33 @@ void loadSDConfigs() {
   loadSDClockConfig();
 }
 
+// ================= RECORDING FILES: FILESYSTEM AS STATE MACHINE =================
+// Recordings are /sdcard/meetings/YYYYMMDD_HHMMSS_<recording_id>_c<0|1>_<status>.wav
+// with status pending -> OK | failed | rejected. The filename is the whole state: the identity and clock
+// validity are fixed when fopen() creates the file, and the status only changes through rename(), which
+// is atomic on FAT. There is no RAM tracking and no manifest that a brownout could leave half-written.
+// Legacy names (YYYYMMDD_HHMMSS_<status>.wav) carry no recording_id.
+String withRecordingStatus(const String &wavPath, const char *status) {
+  int us = wavPath.lastIndexOf('_');
+  if (us == -1) return wavPath;
+  return wavPath.substring(0, us) + "_" + status + ".wav";
+}
+
+// Reads recording_id and clock validity back from the filename; false for legacy names.
+bool parseRecordingIdentity(const String &wavPath, String &recordingId, int &clockValid) {
+  int slash = wavPath.lastIndexOf('/');
+  String name = wavPath.substring(slash + 1);
+  // YYYYMMDD_HHMMSS_ = 16 chars, UUID = 36 chars, then "_c?_" and the status
+  if (name.length() < 57 || name.charAt(15) != '_' || name.charAt(52) != '_' ||
+      name.charAt(53) != 'c' || name.charAt(55) != '_') {
+    return false;
+  }
+  recordingId = name.substring(16, 52);
+  clockValid = (name.charAt(54) == '1') ? 1 : 0;
+  return true;
+}
+
+// Only uploaded (_OK) recordings expire. Failed, pending and rejected files are unsent data and stay until handled.
 void cleanOldRecordings() {
   DIR *dir = opendir("/sdcard/meetings");
   if (!dir) {
@@ -799,11 +852,11 @@ void cleanOldRecordings() {
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     String fname = String(entry->d_name);
-    if (fname.endsWith(".wav") && fname.length() >= 19) {
+    if (fname.endsWith("_OK.wav") && fname.length() >= 19) {
       struct tm ftime;
       memset(&ftime, 0, sizeof(ftime));
       int yr, mon, dy, hr, mn, sc;
-      if (sscanf(fname.c_str(), "%4d%2d%2d_%2d%2d%2d.wav", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
+      if (sscanf(fname.c_str(), "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
         ftime.tm_year = yr - 1900;
         ftime.tm_mon  = mon - 1;
         ftime.tm_mday = dy;
@@ -811,14 +864,51 @@ void cleanOldRecordings() {
         ftime.tm_min  = mn;
         ftime.tm_sec  = sc;
         time_t f_epoch = mktime(&ftime);
-        if (difftime(now, f_epoch) > 172800) { 
-          String fullPath = String("/sdcard/meetings/") + fname;
-          unlink(fullPath.c_str());
+        if (difftime(now, f_epoch) > 172800) {
+          unlink((String("/sdcard/meetings/") + fname).c_str());
         }
       }
     }
   }
   closedir(dir);
+}
+
+// A crash or power loss mid-recording leaves a _pending file whose header is still 44 zero bytes.
+// Rewrite the header from the file size and queue it as _failed so it gets uploaded.
+void recoverPendingRecordings() {
+  DIR *dir = opendir("/sdcard/meetings");
+  if (!dir) return;
+
+  std::vector<String> pending;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    String fname = String(entry->d_name);
+    if (fname.endsWith("_pending.wav")) pending.push_back(String("/sdcard/meetings/") + fname);
+  }
+  closedir(dir);
+
+  for (const String &path : pending) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) continue;
+    if (st.st_size <= 44) {
+      unlink(path.c_str()); // Nothing was recorded
+      continue;
+    }
+    FILE *f = fopen(path.c_str(), "r+b");
+    if (!f) {
+      sdCardError = true;
+      continue;
+    }
+    uint8_t header[44];
+    writeWavHeader(header, (uint32_t)(st.st_size - 44));
+    bool ok = (fwrite(header, 1, 44, f) == 44);
+    fclose(f);
+    if (!ok) {
+      sdCardError = true;
+      continue;
+    }
+    rename(path.c_str(), withRecordingStatus(path, "failed").c_str());
+  }
 }
 
 // ================= LOCALIZATION STRATEGY =================
@@ -836,23 +926,24 @@ void applyLocalizationStrategy() {
   } else {
     // If override=false or empty: Read location details from wifi_database.json associated with active network
     String currentSSID = WiFi.SSID();
-    DynamicJsonDocument doc(8192);
+    JsonDocument doc;
     bool foundInDb = false;
 
     if (readWiFiDatabase(doc) && doc.is<JsonArray>()) {
       for (JsonObject entry : doc.as<JsonArray>()) {
-        if (entry["essid"] && currentSSID == entry["essid"].as<const char*>()) {
-          if (entry["city"] && strlen(entry["city"].as<const char*>()) > 0) {
-            strncpy(city_name, entry["city"], sizeof(city_name) - 1);
+        if (entry["essid"] == currentSSID.c_str()) {
+          const char* db_city = entry["city"].as<const char*>(); // nullptr unless the value is a string
+          if (db_city && strlen(db_city) > 0) {
+            strncpy(city_name, db_city, sizeof(city_name) - 1);
             city_name[sizeof(city_name) - 1] = '\0';
           }
-          if (entry.containsKey("latitude") && !entry["latitude"].isNull()) {
+          if (!entry["latitude"].isNull()) {
             dtostrf(entry["latitude"].as<float>(), 6, 4, latitude);
           }
-          if (entry.containsKey("longitude") && !entry["longitude"].isNull()) {
+          if (!entry["longitude"].isNull()) {
             dtostrf(entry["longitude"].as<float>(), 6, 4, longitude);
           }
-          if (entry.containsKey("gmt") && !entry["gmt"].isNull()) {
+          if (!entry["gmt"].isNull()) {
             gmt_offset = entry["gmt"].as<int>();
           }
           foundInDb = true;
@@ -899,7 +990,49 @@ bool syncNTP() {
 
   rtc.setDate(ti.tm_wday, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
   rtc.setTime(ti.tm_hour, ti.tm_min, ti.tm_sec);
+  clockSyncedSinceBoot = true;
+  // TZ must change together with the RTC: filename timestamps are RTC local time
+  rtc_gmt_offset = gmt_offset;
+  applyTimezone();
   return true;
+}
+
+// The RTC holds local time, so a new UTC offset (another city's network, a DST change, or an
+// Open-Meteo correction) leaves the displayed clock wrong until the 00:00 sync. Rewrite it now.
+// A failed sync leaves rtc_gmt_offset unchanged, so the next sync attempt retries.
+void resyncClockIfOffsetChanged() {
+  if (gmt_offset != rtc_gmt_offset) {
+    syncNTP();
+  }
+}
+
+// The RTC holds local time; mktime() needs TZ to convert it (and WAV filenames) to UTC epochs.
+// POSIX TZ signs are inverted: GMT-5 is "UTC+5".
+void applyTimezone() {
+  char tz[16];
+  snprintf(tz, sizeof(tz), "UTC%+d", -gmt_offset);
+  setenv("TZ", tz, 1);
+  tzset();
+}
+
+// SNTP is the only thing that sets the system clock. Without this, an offline boot leaves
+// time(NULL) near 1970 and every signed upload fails with 401 clock_skew.
+void seedSystemClockFromRTC() {
+  rtc_gmt_offset = gmt_offset; // Best available assumption: the RTC was last set with the saved offset
+  applyTimezone();
+  int yr = rtc.getYear();
+  if (yr < 2024) return; // RTC never set; leave the system clock alone
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_year = yr - 1900;
+  t.tm_mon  = rtc.getMonth() - 1;
+  t.tm_mday = rtc.getDay();
+  t.tm_hour = rtc.getHour();
+  t.tm_min  = rtc.getMinute();
+  t.tm_sec  = rtc.getSecond();
+  t.tm_isdst = 0;
+  struct timeval tv = { .tv_sec = mktime(&t), .tv_usec = 0 };
+  settimeofday(&tv, NULL);
 }
 
 void updateOpenMeteo() {
@@ -917,13 +1050,13 @@ void updateOpenMeteo() {
   http.begin(url);
   int httpCode = http.GET();
   if (httpCode == 200) {
-    DynamicJsonDocument doc(12288);
+    JsonDocument doc;
     deserializeJson(doc, http.getString());
     
     // Reliable fallback: Open-Meteo always provides exact offset in seconds
-    if (doc.containsKey("utc_offset_seconds")) {
+    if (!doc["utc_offset_seconds"].isNull()) {
       gmt_offset = doc["utc_offset_seconds"].as<int>() / 3600;
-    } else if (doc.containsKey("timezone_abbreviation") && !doc["timezone_abbreviation"].isNull()) {
+    } else if (!doc["timezone_abbreviation"].isNull()) {
       const char* tz_abbr = doc["timezone_abbreviation"].as<const char*>();
       const char* p = strstr(tz_abbr, "GMT");
       if (p) {
@@ -1167,20 +1300,85 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 40, &dataSize, 4);
 }
 
-bool streamFileToBackend(const char* filepath) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  
-  // Disable power save to prevent dropped packets, but lower TX power 
+// "HTTP/1.1 202 ACCEPTED" -> 202; anything else -> -1
+int parseHttpStatus(const String &line) {
+  if (!line.startsWith("HTTP/")) return -1;
+  int sp = line.indexOf(' ');
+  if (sp == -1) return -1;
+  return line.substring(sp + 1, sp + 4).toInt();
+}
+
+// Waits for the next status line, or returns "" on timeout or a closed connection.
+String readStatusLine(WiFiClient &client, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() > 0) return line;
+    } else if (!client.connected()) {
+      break;
+    }
+    delay(10);
+  }
+  return "";
+}
+
+// Consumes the headers and a small JSON body after a status line, and extracts error_code.
+void readResponseRest(WiFiClient &client, unsigned long timeoutMs, String &errorCode) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs && (client.connected() || client.available())) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r" || line.length() == 0) break;
+    } else {
+      delay(10);
+    }
+  }
+  char body[512] = {0};
+  size_t len = 0;
+  start = millis();
+  while (millis() - start < timeoutMs && len < sizeof(body) - 1 && (client.connected() || client.available())) {
+    if (client.available()) {
+      body[len++] = (char)client.read();
+    } else {
+      delay(10);
+    }
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, body) == DeserializationError::Ok) {
+    errorCode = doc["error_code"] | "";
+  }
+}
+
+UploadResult classifyUploadResponse(int status, const String &errorCode) {
+  if (status == 200 || status == 202) return UPLOAD_OK;
+  if (status == 409) {
+    if (errorCode == "duplicate") return UPLOAD_OK;               // Server already has this recording
+    if (errorCode == "recording_conflict") return UPLOAD_REJECTED;
+    return UPLOAD_RETRY_LATER;                                    // e.g. upload_in_progress
+  }
+  if (status == 401 && errorCode == "clock_skew") return UPLOAD_CLOCK_SKEW;
+  if (status == 400 && errorCode == "hash_mismatch") return UPLOAD_RETRY_LATER; // SD read glitch: re-hash next attempt
+  if (status == 408 || status == 429 || status == 507 || status >= 500 || status < 0) return UPLOAD_RETRY_LATER;
+  return UPLOAD_REJECTED;
+}
+
+UploadResult streamFileToBackend(const char* filepath) {
+  if (WiFi.status() != WL_CONNECTED) return UPLOAD_RETRY_LATER;
+
+  // Disable power save to prevent dropped packets, but lower TX power
   // to 8.5dBm to prevent 3.3V rail brownouts during SD card reads.
+  // Applied before the SHA-256 pass: hashing is a full SD read of the recording too.
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
     WiFi.setSleep(true);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    return false;
+    return UPLOAD_RETRY_LATER;
   }
 
   fseek(f, 0, SEEK_END);
@@ -1198,22 +1396,26 @@ bool streamFileToBackend(const char* filepath) {
   String request_id = generateUUIDv4();
   unsigned long request_timestamp = time(NULL);
 
-  unsigned long file_recording_started_at = current_recording_started_at;
+  // Identity comes from the filename fixed at recording start, so every retry sends the same values.
+  // Legacy names have no ID: the header is omitted and the server derives it from device_id + start time.
+  String recording_id = "";
+  int file_clock_valid = 0;
+  parseRecordingIdentity(String(filepath), recording_id, file_clock_valid);
+
+  unsigned long file_recording_started_at = 0;
   const char* fname = strrchr(filepath, '/');
-  if (fname != NULL) {
-    fname++; // Skip the '/' character
-    int yr, mon, dy, hr, mn, sc;
-    if (sscanf(fname, "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
-      struct tm ftime;
-      memset(&ftime, 0, sizeof(ftime));
-      ftime.tm_year = yr - 1900;
-      ftime.tm_mon  = mon - 1;
-      ftime.tm_mday = dy;
-      ftime.tm_hour = hr;
-      ftime.tm_min  = mn;
-      ftime.tm_sec  = sc;
-      file_recording_started_at = mktime(&ftime);
-    }
+  fname = fname ? fname + 1 : filepath;
+  int yr, mon, dy, hr, mn, sc;
+  if (sscanf(fname, "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
+    struct tm ftime;
+    memset(&ftime, 0, sizeof(ftime));
+    ftime.tm_year = yr - 1900;
+    ftime.tm_mon  = mon - 1;
+    ftime.tm_mday = dy;
+    ftime.tm_hour = hr;
+    ftime.tm_min  = mn;
+    ftime.tm_sec  = sc;
+    file_recording_started_at = mktime(&ftime);
   }
 
   // 5-field HMAC Signature matching the backend requirement
@@ -1225,60 +1427,53 @@ bool streamFileToBackend(const char* filepath) {
 
   String signature = computeHMACSHA256(canonical, hmac_secret);
 
+  int status = -1;
+  String errorCode = "";
   WiFiClient client;
   client.setTimeout(30000); 
 
-  if (!client.connect(host.c_str(), port)) {
-    fclose(f);
-    WiFi.setSleep(true);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    return false;
-  }
-
-  client.print("POST /api/upload HTTP/1.1\r\n");
-  client.print("Host: " + host + "\r\n");
-  client.print("Content-Type: audio/wav\r\n");
-  client.print("Content-Length: " + String(fileSize) + "\r\n");
-  client.print("Expect: 100-continue\r\n");
-  client.print("X-Device-Id: " + String(device_id) + "\r\n");
-  client.print("X-Key-Id: " + String(key_id) + "\r\n");
-  client.print("X-Request-Id: " + request_id + "\r\n");
-  client.print("X-Recording-Id: " + String(current_recording_id) + "\r\n");
-  client.print("X-Recording-Started-At: " + String(file_recording_started_at) + "\r\n");
-  client.print("X-Clock-Valid: " + String(current_clock_valid) + "\r\n");
-  client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
-  client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
-  client.print("X-Signature: " + signature + "\r\n");
-  client.print("Connection: close\r\n\r\n");
-
-  unsigned long waitStart = millis();
-  bool sendBody = true;
-  String responseHeaders = "";
-  
-  while (millis() - waitStart < 5000) {
-    if (client.available()) {
-      responseHeaders = client.readStringUntil('\n');
-      if (responseHeaders.indexOf("100 Continue") != -1) {
-        while (client.available() && client.readStringUntil('\n') != "\r");
-        sendBody = true;
-        break;
-      } else if (responseHeaders.indexOf("HTTP/") != -1 && responseHeaders.indexOf(" 200") == -1 && responseHeaders.indexOf(" 202") == -1) {
-        sendBody = false;
-        break;
-      }
+  if (client.connect(host.c_str(), port)) {
+    client.print("POST /api/upload HTTP/1.1\r\n");
+    client.print("Host: " + host + "\r\n");
+    client.print("Content-Type: audio/wav\r\n");
+    client.print("Content-Length: " + String(fileSize) + "\r\n");
+    client.print("Expect: 100-continue\r\n");
+    client.print("X-Device-Id: " + String(device_id) + "\r\n");
+    client.print("X-Key-Id: " + String(key_id) + "\r\n");
+    client.print("X-Request-Id: " + request_id + "\r\n");
+    if (recording_id.length() > 0) {
+      client.print("X-Recording-Id: " + recording_id + "\r\n");
     }
-    delay(10);
-  }
+    client.print("X-Recording-Started-At: " + String(file_recording_started_at) + "\r\n");
+    client.print("X-Clock-Valid: " + String(file_clock_valid) + "\r\n");
+    client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
+    client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
+    client.print("X-Signature: " + signature + "\r\n");
+    client.print("Connection: close\r\n\r\n");
 
-  if (sendBody) {
-    uint8_t *sendBuf = (uint8_t*)malloc(AUDIO_FRAME_SIZE); // Uses global AUDIO_FRAME_SIZE
-    if (sendBuf) {
-      size_t remaining = fileSize;
-      while (remaining > 0) {
-        size_t toRead = (remaining > AUDIO_FRAME_SIZE) ? AUDIO_FRAME_SIZE : remaining;
-        size_t bytesRead = fread(sendBuf, 1, toRead, f);
-        
-        if (bytesRead > 0) {
+    // The server answers 100 Continue once the headers pass, or a final status (401, 409, duplicate 202...)
+    // without reading the body. No answer within 5 s means it ignores Expect, so send the body anyway.
+    String firstLine = readStatusLine(client, 5000);
+    int firstStatus = parseHttpStatus(firstLine);
+    bool sendBody = (firstLine.length() == 0 || firstStatus == 100);
+
+    if (firstStatus == 100) {
+      while (client.available() && client.readStringUntil('\n') != "\r");
+    } else if (firstStatus > 0) {
+      status = firstStatus;
+      readResponseRest(client, 5000, errorCode);
+    }
+
+    if (sendBody) {
+      bool bodyComplete = false;
+      uint8_t *sendBuf = (uint8_t*)malloc(AUDIO_FRAME_SIZE); // Uses global AUDIO_FRAME_SIZE
+      if (sendBuf) {
+        size_t remaining = fileSize;
+        while (remaining > 0) {
+          size_t toRead = (remaining > AUDIO_FRAME_SIZE) ? AUDIO_FRAME_SIZE : remaining;
+          size_t bytesRead = fread(sendBuf, 1, toRead, f);
+          if (bytesRead == 0) break; // File read error
+
           // Robust retry loop for Wi-Fi buffer congestion
           size_t written = 0;
           int retries = 0;
@@ -1292,47 +1487,50 @@ bool streamFileToBackend(const char* filepath) {
               delay(50); // Yield to LwIP network stack to free TX buffers
             }
           }
-          
-          if (written < bytesRead) {
-            break; // Hard disconnect after 1 full second of failure, exit cleanly
-          }
-          
+          if (written < bytesRead) break; // Hard disconnect after 1 full second of failure
+
           remaining -= bytesRead;
           delay(2); // Keep watchdog alive
-        } else {
-          break; // File read error
         }
+        bodyComplete = (remaining == 0);
+        free(sendBuf);
       }
-      free(sendBuf);
-    }
-  } else {
-    fclose(f);
-    client.stop();
-    WiFi.setSleep(true);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    return false;
-  }
-  
-  fclose(f);
 
-  unsigned long timeout = millis();
-  bool got202 = false;
-  while (client.connected() && millis() - timeout < 5000) {
-    if (client.available()) {
-      String line = client.readStringUntil('\n');
-      if (line.indexOf("HTTP/") != -1 && (line.indexOf(" 202 ") != -1 || line.indexOf(" 200 ") != -1)) {
-        got202 = true;
+      if (bodyComplete) {
+        // Skip a late interim 100 Continue if the body went out before it arrived
+        String line = readStatusLine(client, 10000);
+        if (parseHttpStatus(line) == 100) {
+          while (client.available() && client.readStringUntil('\n') != "\r");
+          line = readStatusLine(client, 10000);
+        }
+        status = parseHttpStatus(line);
+        if (status > 0) readResponseRest(client, 5000, errorCode);
       }
     }
-    delay(10);
+    client.stop();
   }
-  client.stop();
+  fclose(f);
   
   // Re-enable power save mode and restore maximum TX power
   WiFi.setSleep(true); 
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   
-  return got202;
+  return classifyUploadResponse(status, errorCode);
+}
+
+// Uploads one recording and renames it by outcome. A clock_skew rejection gets one NTP resync and retry.
+UploadResult uploadRecordingFile(String &wavPath) {
+  UploadResult result = streamFileToBackend(wavPath.c_str());
+  if (result == UPLOAD_CLOCK_SKEW && syncNTP()) {
+    result = streamFileToBackend(wavPath.c_str());
+  }
+
+  const char *status = (result == UPLOAD_OK) ? "OK" : (result == UPLOAD_REJECTED) ? "rejected" : "failed";
+  String newPath = withRecordingStatus(wavPath, status);
+  if (newPath != wavPath && rename(wavPath.c_str(), newPath.c_str()) == 0) {
+    wavPath = newPath;
+  }
+  return result;
 }
 
 void drawMeetingAssistantUI(const char* extraStatus = NULL) {
@@ -1427,52 +1625,59 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
     } else if (strlen(currentMeetingFileName) > 0) {
       canvas.setFont(&FreeSansBold9pt7b);
       canvas.setCursor(20, 235);
-      canvas.print("Last: ");
-      const char *shortName = strrchr(currentMeetingFileName, '/');
-      canvas.print(shortName ? shortName + 1 : currentMeetingFileName);
+      // The full name (with the recording_id) is too wide for the screen: show "YYYYMMDD_HHMMSS (status)"
+      String lastName = String(currentMeetingFileName);
+      lastName = lastName.substring(lastName.lastIndexOf('/') + 1);
+      String lastStatus = lastName.substring(lastName.lastIndexOf('_') + 1);
+      lastStatus.replace(".wav", "");
+      canvas.print("Last: " + lastName.substring(0, 15) + " (" + lastStatus + ")");
     }
   }
 
   pushCanvasToRLCD(false);
 }
 
+const char* uploadResultMessage(UploadResult result) {
+  switch (result) {
+    case UPLOAD_OK:       return "Saved & Transmitted!";
+    case UPLOAD_REJECTED: return "Rejected by server (kept)";
+    default:              return "Upload Failed (will retry)";
+  }
+}
+
 void processFailedUploads() {
+  // Collect names first: renaming entries while readdir() walks the FAT directory can skip files
   DIR *dir = opendir("/sdcard/meetings");
   if (!dir) return;
-
-  bool hadFailedUploads = false;
+  std::vector<String> failed;
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     String fname = String(entry->d_name);
-    if (fname.endsWith("_failed.wav")) {
-      hadFailedUploads = true;
-      String fullPath = String("/sdcard/meetings/") + fname;
-      String shortName = fname.substring(9, 15);
-      drawMeetingAssistantUI(("Syncing " + shortName + "...").c_str());
-      
-      if (streamFileToBackend(fullPath.c_str())) {
-        String newName = fullPath;
-        newName.replace("_failed.wav", "_OK.wav");
-        rename(fullPath.c_str(), newName.c_str());
-        drawMeetingAssistantUI("Saved & Transmitted!");
-      }
-    }
+    if (fname.endsWith("_failed.wav")) failed.push_back(fname);
   }
   closedir(dir);
 
-  if (hadFailedUploads) {
-    drawMeetingAssistantUI("All syncs complete!");
-  } else {
-    drawMeetingAssistantUI("Saved & Transmitted!");
+  for (const String &fname : failed) {
+    String fullPath = String("/sdcard/meetings/") + fname;
+    String shortName = fname.substring(9, 15);
+    drawMeetingAssistantUI(("Syncing " + shortName + "...").c_str());
+    UploadResult result = uploadRecordingFile(fullPath);
+    drawMeetingAssistantUI(uploadResultMessage(result));
   }
+
+  drawMeetingAssistantUI(failed.empty() ? "Saved & Transmitted!" : "All syncs complete!");
 }
 
 void startMeetingRecording() {
   if (sdCardError) return;
 
-  sprintf(currentMeetingFileName, "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d_pending.wav",
-          rtc.getYear(), rtc.getMonth(), rtc.getDay(),
-          rtc.getHour(), rtc.getMinute(), rtc.getSecond());
+  // The identity is part of the name from the moment the file exists, so every retry
+  // (even after a reboot) sends the same recording_id
+  snprintf(currentMeetingFileName, sizeof(currentMeetingFileName),
+           "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d_%s_c%d_pending.wav",
+           rtc.getYear(), rtc.getMonth(), rtc.getDay(),
+           rtc.getHour(), rtc.getMinute(), rtc.getSecond(),
+           generateUUIDv4().c_str(), clockSyncedSinceBoot ? 1 : 0);
 
   currentMeetingFile = fopen(currentMeetingFileName, "wb");
   if (!currentMeetingFile) {
@@ -1490,10 +1695,7 @@ void startMeetingRecording() {
     return;
   }
 
-  strncpy(current_recording_id, generateUUIDv4().c_str(), sizeof(current_recording_id) - 1);
-  current_recording_id[sizeof(current_recording_id) - 1] = '\0';
-  current_recording_started_at = time(NULL); 
-  current_clock_valid = (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) ? 1 : 0;
+  enterRecordingQuietMode(); // Radio, NTP, speaker and sensors off before the first audio frame
 
   totalRecordedBytes = 0;
   recordingStartTime = millis();
@@ -1529,31 +1731,21 @@ void stopMeetingRecording() {
   setLowPowerClock(false); // Boost CPU for high-speed transmission
   bool connected = ensureWiFiConnected(6);
 
+  String meetingPath = String(currentMeetingFileName);
   if (connected) {
     drawMeetingAssistantUI("Syncing to Mac...");
-    bool success = streamFileToBackend(currentMeetingFileName);
-    if (success) {
-      String okName = String(currentMeetingFileName);
-      okName.replace("_pending.wav", "_OK.wav");
-      rename(currentMeetingFileName, okName.c_str());
-      strncpy(currentMeetingFileName, okName.c_str(), sizeof(currentMeetingFileName) - 1);
-      currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
-      drawMeetingAssistantUI("Saved & Transmitted!");
+    UploadResult result = uploadRecordingFile(meetingPath);
+    strncpy(currentMeetingFileName, meetingPath.c_str(), sizeof(currentMeetingFileName) - 1);
+    currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
+    drawMeetingAssistantUI(uploadResultMessage(result));
+    if (result == UPLOAD_OK) {
       processFailedUploads();
-    } else {
-      drawMeetingAssistantUI("Upload Failed (5XX/Offline)");
-      String failedName = String(currentMeetingFileName);
-      failedName.replace("_pending.wav", "_failed.wav");
-      rename(currentMeetingFileName, failedName.c_str());
-      strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
-      currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     }
     disableWiFi(); // Immediately shut down Wi-Fi after transmission concludes
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
-    String failedName = String(currentMeetingFileName);
-    failedName.replace("_pending.wav", "_failed.wav");
-    rename(currentMeetingFileName, failedName.c_str());
+    String failedName = withRecordingStatus(meetingPath, "failed");
+    rename(meetingPath.c_str(), failedName.c_str());
     strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
     currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     disableWiFi(); // Power down Wi-Fi if connection attempt fails
@@ -1711,20 +1903,60 @@ void startWiFiConfiguratorAP() {
 }
 
 // ================= POWER & DISPATCH =================
+// Powers down the ES8311 DAC and its amplifier while keeping the ES7210 microphones running.
+// Both codecs share one full-duplex I2S port: while the mic (RX) is open, esp_codec_dev only marks
+// the TX disable as pending, so the mic clocks keep running; CodecPort_CloseMic() later stops both.
+// The speaker is opened together with the mic on purpose: opening only the mic would leave the TX
+// channel enabled from init_codec(), and the I2S clocks would never stop on the other screens.
+// The ES8311 driver also owns the amplifier pin (pa: 46 in board_cfg.h) and lowers it on close.
+void silenceSpeaker() {
+  if (codecport && codecActive) {
+    codecport->CodecPort_CloseSpeaker();
+  }
+  digitalWrite(PA_CTRL, LOW);
+}
+
+// Recording captures only the microphones: no RF bursts or network activity, no speaker hiss or
+// feedback, no sensor I2C traffic. Called when a recording starts; every path below also refuses
+// to wake these up while isRecording is set.
+void enterRecordingQuietMode() {
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop(); // No periodic NTP retries in the background
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF); // Unconditional: disableWiFi() keeps the radio on for Screen 3
+  btStop();            // No-op today (Bluetooth never runs); guarantees no BLE radio during recording
+  silenceSpeaker();
+  shtc3_sleep();
+}
+
 void applyScreenPowerMode(AppScreen scr) {
   if (scr == SCREEN_MEETING) {
     setLowPowerClock(false); // Boost CPU for 16 kHz I2S audio reading
-    digitalWrite(PA_CTRL, HIGH);
     if (!codecport) {
       codecport = new CodecPort(I2cbus, "S3_RLCD_4_2");
       codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE); // Uses global BITS_PER_SAMPLE
       codecport->CodecPort_SetMicGain(35);
+      codecActive = true;
+    } else if (!codecActive) {
+      // Re-open the codec devices that were put in standby when leaving Screen 2
+      codecport->CodecPort_SetInfo("es8311 & es7210", 1, SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE);
+      codecport->CodecPort_SetMicGain(35);
+      codecActive = true;
     }
+    silenceSpeaker(); // Nothing is ever played: only the microphone path stays powered on Screen 2
   } else {
     if (isRecording) {
       stopMeetingRecording();
     }
     digitalWrite(PA_CTRL, LOW);
+    if (codecport && codecActive) {
+      // Put ES8311/ES7210 in standby and stop the I2S clocks while away from Screen 2.
+      // Mic first: closing RX also applies the TX disable left pending by silenceSpeaker().
+      codecport->CodecPort_CloseMic();
+      codecport->CodecPort_CloseSpeaker();
+      codecActive = false;
+    }
   }
 
   if (scr == SCREEN_CONFIG) {
@@ -1741,9 +1973,42 @@ void applyScreenPowerMode(AppScreen scr) {
   }
 }
 
+// Light sleep until the next minute rollover (RTC) or a press of the screen cycle button.
+// RAM, peripherals and GPIO levels are retained, so the RLCD keeps its image and loop() resumes in place.
+void enterClockLightSleep() {
+  // Skip while the button is held, otherwise the low-level wakeup would fire immediately
+  if (digitalRead(BUTTON_PIN) == LOW) return;
+
+  int sec = rtc.getSecond();
+  if (sec < 0 || sec > 59) sec = 0;
+  uint64_t sleepUs = (uint64_t)(60 - sec) * 1000000ULL + 200000ULL; // Wake 200ms after the minute changes
+
+  // Keep display, I2C, amplifier and button pins in their active configuration during sleep
+  const gpio_num_t keepPins[] = {GPIO_NUM_12, GPIO_NUM_11, GPIO_NUM_5, GPIO_NUM_40, GPIO_NUM_41,
+                                 (gpio_num_t)I2C_SDA, (gpio_num_t)I2C_SCL, (gpio_num_t)PA_CTRL,
+                                 (gpio_num_t)BUTTON_PIN};
+  for (gpio_num_t pin : keepPins) {
+    gpio_sleep_sel_dis(pin);
+  }
+
+  esp_sleep_enable_timer_wakeup(sleepUs);
+  gpio_wakeup_enable((gpio_num_t)BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  Serial.flush();
+  esp_light_sleep_start();
+
+  gpio_wakeup_disable((gpio_num_t)BUTTON_PIN);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  // Bluetooth is never used. The core already skips starting it and frees its memory at boot
+  // (no BT library is linked); this keeps the controller off even if a future library starts it.
+  btStop();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(RECORD_BUTTON_PIN, INPUT_PULLUP);
@@ -1762,7 +2027,9 @@ void setup() {
   shtc3_read_i2cbus(temp_shtc3, hum_shtc3);
 
   loadSDConfigs();
+  seedSystemClockFromRTC();   // Needs gmt_offset from config_clock.txt; before anything reads time(NULL)
   cleanOldRecordings();
+  recoverPendingRecordings(); // Repair files cut off by a crash or power loss and queue them as _failed
 
   // Primary Attempt & Database Fallback during boot
   bool connected = ensureWiFiConnected(8);
@@ -1913,6 +2180,7 @@ void loop() {
               strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
             }
             updateOpenMeteo();
+            resyncClockIfOffsetChanged();
             saveWiFiTxtConfig();
             saveSDClockConfig();
             if (currentScreen == SCREEN_CLOCK) {
@@ -1974,6 +2242,11 @@ void loop() {
             }
           }
 
+          // The scheduled weather trigger already attempted Wi-Fi this minute; avoid a second connection attempt
+          if (isWeatherMinute && lastWeatherSyncMinute == curMin) {
+            shouldRetry = false;
+          }
+
           if (shouldRetry && !isRecording) {
             setLowPowerClock(false);
             if (ensureWiFiConnected(6)) {
@@ -1982,6 +2255,7 @@ void loop() {
                 strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
               }
               updateOpenMeteo();
+              resyncClockIfOffsetChanged();
               saveWiFiTxtConfig();
               saveSDClockConfig();
               disableWiFi();
@@ -2003,6 +2277,7 @@ void loop() {
   // Adaptive delay: 100ms idle delay on Clock Screen saves CPU cycles, 20ms elsewhere
   if (currentScreen == SCREEN_CLOCK && !isRecording) {
     delay(100);
+    enterClockLightSleep(); // Screen 1: sleep between minute ticks instead of polling
   } else {
     delay(20);
   }
