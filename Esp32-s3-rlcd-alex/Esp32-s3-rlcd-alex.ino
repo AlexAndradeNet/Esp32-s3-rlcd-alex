@@ -108,6 +108,7 @@ int lastWeatherSyncMinute = -1;
 bool timeSyncedToday = false;
 static volatile bool ntpPacketReceived = false;
 bool clockSyncedSinceBoot = false; // Set only by a confirmed NTP sync; esp_sntp_get_sync_status() resets after each read
+int rtc_gmt_offset = 0;            // UTC offset the RTC's local time was last written with (and the active TZ)
 
 // Network State Cache (Displayed while Wi-Fi radio is powered off)
 String lastKnownIP = "No Wi-Fi";
@@ -172,6 +173,7 @@ bool queryBigDataCloudCity();
 bool syncNTP();
 void updateOpenMeteo();
 void processFailedUploads();
+void resyncClockIfOffsetChanged();
 void writeWavHeader(uint8_t* buffer, uint32_t dataSize);
 
 // ================= CRYPTOGRAPHY & ID GENERATION =================
@@ -539,7 +541,7 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
 
       applyLocalizationStrategy();
 
-      // City Change Handling: If city changed, sync time immediately upon connection
+      // City Change Handling: track the city; the time resync below is driven by the UTC offset
       if (strlen(last_synced_city) > 0 && strcmp(last_synced_city, city_name) != 0) {
         strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
       }
@@ -548,6 +550,9 @@ bool ensureWiFiConnected(int maxWaitSec = 6) {
       if (netChanged) {
         updateOpenMeteo();
       }
+
+      // A new city or an Open-Meteo correction may have changed the offset: sync time immediately
+      resyncClockIfOffsetChanged();
     } else {
       if (activeSSID.length() > 0) {
         strncpy(current_network, activeSSID.c_str(), sizeof(current_network) - 1);
@@ -975,7 +980,19 @@ bool syncNTP() {
   rtc.setDate(ti.tm_wday, ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900);
   rtc.setTime(ti.tm_hour, ti.tm_min, ti.tm_sec);
   clockSyncedSinceBoot = true;
+  // TZ must change together with the RTC: filename timestamps are RTC local time
+  rtc_gmt_offset = gmt_offset;
+  applyTimezone();
   return true;
+}
+
+// The RTC holds local time, so a new UTC offset (another city's network, a DST change, or an
+// Open-Meteo correction) leaves the displayed clock wrong until the 00:00 sync. Rewrite it now.
+// A failed sync leaves rtc_gmt_offset unchanged, so the next sync attempt retries.
+void resyncClockIfOffsetChanged() {
+  if (gmt_offset != rtc_gmt_offset) {
+    syncNTP();
+  }
 }
 
 // The RTC holds local time; mktime() needs TZ to convert it (and WAV filenames) to UTC epochs.
@@ -990,6 +1007,7 @@ void applyTimezone() {
 // SNTP is the only thing that sets the system clock. Without this, an offline boot leaves
 // time(NULL) near 1970 and every signed upload fails with 401 clock_skew.
 void seedSystemClockFromRTC() {
+  rtc_gmt_offset = gmt_offset; // Best available assumption: the RTC was last set with the saved offset
   applyTimezone();
   int yr = rtc.getYear();
   if (yr < 2024) return; // RTC never set; leave the system clock alone
@@ -2118,6 +2136,7 @@ void loop() {
               strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
             }
             updateOpenMeteo();
+            resyncClockIfOffsetChanged();
             saveWiFiTxtConfig();
             saveSDClockConfig();
             if (currentScreen == SCREEN_CLOCK) {
@@ -2192,6 +2211,7 @@ void loop() {
                 strncpy(last_synced_city, city_name, sizeof(last_synced_city) - 1);
               }
               updateOpenMeteo();
+              resyncClockIfOffsetChanged();
               saveWiFiTxtConfig();
               saveSDClockConfig();
               disableWiFi();
