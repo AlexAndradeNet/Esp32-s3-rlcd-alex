@@ -2017,6 +2017,11 @@ void loop() {
             }
           }
 
+          // The scheduled weather trigger already attempted Wi-Fi this minute; avoid a second connection attempt
+          if (isWeatherMinute && lastWeatherSyncMinute == curMin) {
+            shouldRetry = false;
+          }
+
           if (shouldRetry && !isRecording) {
             setLowPowerClock(false);
             if (ensureWiFiConnected(6)) {
