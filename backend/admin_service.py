@@ -1,7 +1,9 @@
 import os
+import struct
 import argparse
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, send_file
+import numpy as np
+from flask import Flask, request, jsonify, render_template_string, send_file, Response
 from dotenv import load_dotenv
 from db import init_db, get_db_connection, get_current_transcript
 
@@ -133,11 +135,78 @@ def get_meeting_audio(job_id):
     meeting = conn.execute("SELECT audio_relpath FROM meetings WHERE job_id = ?", (job_id,)).fetchone()
     conn.close()
 
-    if not meeting or not meeting["audio_relpath"]:
-        return jsonify({"error_code": "audio_deleted", "message": "Audio file not available"}), 410
+    if not meeting:
+        return jsonify({"error_code": "not_found", "message": "Meeting not found"}), 404
+    if not meeting["audio_relpath"] or not os.path.exists(meeting["audio_relpath"]):
+        return jsonify({"error_code": "audio_missing", "message": "Audio file not available"}), 410
 
     audio_path = os.path.abspath(meeting["audio_relpath"])
+    wav = read_wav_layout(audio_path)
+    if wav and wav["format_tag"] == WAVE_FORMAT_MULAW:
+        return stream_mulaw_as_pcm16(audio_path, wav)
+    # Linear PCM plays everywhere; send_file also serves Range requests for seeking
     return send_file(audio_path, mimetype="audio/wav")
+
+# ==========================================
+# AUDIO PLAYBACK
+# ==========================================
+WAVE_FORMAT_MULAW = 7
+
+def build_ulaw_to_pcm16_table():
+    """G.711 µ-law byte -> 16-bit linear sample (the inverse of the device's pcm16_to_ulaw)."""
+    u = (~np.arange(256, dtype=np.int32)) & 0xFF
+    t = (((u & 0x0F) << 3) + 0x84) << ((u & 0x70) >> 4)
+    return np.where(u & 0x80, 0x84 - t, t - 0x84).astype("<i2")
+
+ULAW_TO_PCM16 = build_ulaw_to_pcm16_table()
+
+def read_wav_layout(path):
+    """Returns the fmt fields and the data chunk position of a RIFF/WAVE file, or None."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"RIFF" or f.read(8)[4:] != b"WAVE":
+                return None
+            layout = {}
+            while True:
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    return None
+                chunk_id, size = chunk[:4], struct.unpack("<I", chunk[4:])[0]
+                if chunk_id == b"fmt ":
+                    fmt = f.read(size)
+                    layout["format_tag"], layout["channels"], layout["sample_rate"] = struct.unpack("<HHI", fmt[:8])
+                elif chunk_id == b"data":
+                    layout["data_offset"] = f.tell()
+                    # Never trust the header beyond the bytes actually on disk
+                    layout["data_size"] = min(size, os.path.getsize(path) - layout["data_offset"])
+                    return layout if "format_tag" in layout else None
+                else:
+                    f.seek(size + (size & 1), os.SEEK_CUR)
+    except OSError:
+        return None
+
+def stream_mulaw_as_pcm16(path, wav):
+    """Browsers disagree on µ-law WAV playback, so decode it to 16-bit PCM on the fly.
+    The stored file is never modified."""
+    pcm_size = wav["data_size"] * 2
+    header = (b"RIFF" + struct.pack("<I", 36 + pcm_size) + b"WAVEfmt " +
+              struct.pack("<IHHIIHH", 16, 1, wav["channels"], wav["sample_rate"],
+                          wav["sample_rate"] * wav["channels"] * 2, wav["channels"] * 2, 16) +
+              b"data" + struct.pack("<I", pcm_size))
+
+    def generate():
+        yield header
+        with open(path, "rb") as f:
+            f.seek(wav["data_offset"])
+            remaining = wav["data_size"]
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield ULAW_TO_PCM16[np.frombuffer(chunk, dtype=np.uint8)].tobytes()
+
+    return Response(generate(), mimetype="audio/wav", headers={"Content-Length": str(len(header) + pcm_size)})
 
 @app.route("/api/participants", methods=["GET", "POST"])
 @require_admin_auth
@@ -210,6 +279,12 @@ DASHBOARD_HTML = r"""
         button:hover { background: #0056b3; }
         .btn-view { background: #34c759; }
         .btn-view:hover { background: #248a3d; }
+        .btn-listen { background: #5856d6; }
+        .btn-listen:hover { background: #3f3db0; }
+        .audio-block { margin-bottom: 20px; }
+        .audio-block audio { width: 100%; display: none; margin-bottom: 8px; }
+        .audio-download { display: none; color: #007aff; margin-right: 12px; }
+        .audio-status { color: #6e6e73; }
         
         /* Modal Styles */
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.5); }
@@ -251,11 +326,32 @@ DASHBOARD_HTML = r"""
             <h2>Meeting Report</h2>
             <p><strong>Job ID:</strong> <span id="modalJobId"></span></p>
 
+            <h3>Recording</h3>
+            <div class="audio-block">
+                <audio id="reportAudio" controls preload="metadata"></audio>
+                <a id="reportAudioDownload" class="audio-download">Download .wav</a>
+                <span id="reportAudioStatus" class="audio-status"></span>
+            </div>
+
             <h3>AI Summary</h3>
             <div id="modalSummary" class="report-section">Loading...</div>
             
             <h3>Raw Transcript</h3>
             <div id="modalTranscript" class="report-section">Loading...</div>
+        </div>
+    </div>
+
+    <!-- Audio Modal (any job state: the recording exists from the moment it is accepted) -->
+    <div id="audioModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal()">&times;</span>
+            <h2>Recording</h2>
+            <p><strong>Job ID:</strong> <span id="audioJobId"></span></p>
+            <div class="audio-block">
+                <audio id="listenAudio" controls preload="metadata"></audio>
+                <a id="listenAudioDownload" class="audio-download">Download .wav</a>
+                <span id="listenAudioStatus" class="audio-status"></span>
+            </div>
         </div>
     </div>
 
@@ -307,6 +403,7 @@ DASHBOARD_HTML = r"""
                         <td>${formatClientTime(j.uploaded_at)}</td>
                         <td>
                             <button onclick="retryJob('${j.job_id}')">Retry</button>
+                            <button class="btn-listen" onclick="listenAudio('${j.job_id}')">Listen</button>
                             ${j.state === 'COMPLETED' ? `<button class="btn-view" onclick="viewReport('${j.job_id}')">View Report</button>` : ''}
                         </td>
                     `;
@@ -332,6 +429,7 @@ DASHBOARD_HTML = r"""
             document.getElementById('modalJobId').innerText = jobId;
             document.getElementById('modalSummary').innerText = "Loading summary...";
             document.getElementById('modalTranscript').innerText = "Loading transcript...";
+            loadAudio(jobId, 'reportAudio', 'reportAudioDownload', 'reportAudioStatus');
 
             try {
                 const res = await fetch(`/api/meetings/${jobId}`, { headers: AUTH_HEADER });
@@ -350,14 +448,65 @@ DASHBOARD_HTML = r"""
             }
         }
 
+        // <audio src> cannot send the Authorization header, so fetch the file with it
+        // and play it from a local blob URL. Only one recording is held in memory at a time.
+        let currentAudioUrl = null;
+
+        function releaseAudio() {
+            ['reportAudio', 'listenAudio'].forEach(id => {
+                const player = document.getElementById(id);
+                player.pause();
+                player.removeAttribute('src');
+                player.load();
+            });
+            if (currentAudioUrl) {
+                URL.revokeObjectURL(currentAudioUrl);
+                currentAudioUrl = null;
+            }
+        }
+
+        async function loadAudio(jobId, playerId, downloadId, statusId) {
+            const player = document.getElementById(playerId);
+            const download = document.getElementById(downloadId);
+            const status = document.getElementById(statusId);
+            releaseAudio();
+            player.style.display = 'none';
+            download.style.display = 'none';
+            status.innerText = 'Loading audio...';
+            try {
+                const res = await fetch(`/api/meetings/${jobId}/audio`, { headers: AUTH_HEADER });
+                if (!res.ok) {
+                    const err = await res.json().catch(() => ({}));
+                    status.innerText = err.message || `Audio unavailable (HTTP ${res.status})`;
+                    return;
+                }
+                currentAudioUrl = URL.createObjectURL(await res.blob());
+                player.src = currentAudioUrl;
+                player.style.display = 'block';
+                download.href = currentAudioUrl;
+                download.download = `${jobId}.wav`;
+                download.style.display = 'inline-block';
+                status.innerText = '';
+            } catch(e) {
+                status.innerText = 'Error loading audio.';
+            }
+        }
+
+        function listenAudio(jobId) {
+            document.getElementById('audioModal').style.display = 'block';
+            document.getElementById('audioJobId').innerText = jobId;
+            loadAudio(jobId, 'listenAudio', 'listenAudioDownload', 'listenAudioStatus');
+        }
+
         function closeModal() {
             document.getElementById('reportModal').style.display = 'none';
+            document.getElementById('audioModal').style.display = 'none';
+            releaseAudio();
         }
 
         window.onclick = function(event) {
-            const modal = document.getElementById('reportModal');
-            if (event.target == modal) {
-                modal.style.display = "none";
+            if (event.target.classList && event.target.classList.contains('modal')) {
+                closeModal();
             }
         }
 

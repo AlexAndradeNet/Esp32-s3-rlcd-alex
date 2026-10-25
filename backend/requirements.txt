@@ -6,3 +6,4 @@ mlx-whisper>=0.4.3
 requests>=2.31.0
 mlx>=0.32.4
 mlx-lm>=0.32.4
+numpy>=1.26
