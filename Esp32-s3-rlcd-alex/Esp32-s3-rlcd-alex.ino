@@ -30,6 +30,7 @@
 #include "esp_sntp.h"
 #include "mbedtls/md.h"
 #include <sys/time.h>
+#include <vector>
 
 #include "sdcard_bsp.h"
 
@@ -133,6 +134,14 @@ char hmac_secret[128] = "";
 char current_recording_id[64] = "";
 unsigned long current_recording_started_at = 0;
 int current_clock_valid = 0;
+
+// ---------- UPLOAD OUTCOMES ----------
+enum UploadResult {
+  UPLOAD_OK = 0,        // 200/202, or 409 duplicate: the server has the file
+  UPLOAD_RETRY_LATER,   // Network error, timeout, 408, 429, 5xx, 507, hash mismatch
+  UPLOAD_CLOCK_SKEW,    // 401 clock_skew: resync NTP, then retry
+  UPLOAD_REJECTED       // Other 4xx or recording_conflict: keep the file, never retry
+};
 
 // ---------- AUDIO RECORDING STATE & SD WATCHDOG ----------
 uint8_t frame_buffer[AUDIO_FRAME_SIZE];
@@ -787,6 +796,12 @@ void loadSDConfigs() {
   loadSDClockConfig();
 }
 
+String withRecordingStatus(const String &wavPath, const char *status) {
+  int us = wavPath.lastIndexOf('_');
+  if (us == -1) return wavPath;
+  return wavPath.substring(0, us) + "_" + status + ".wav";
+}
+
 void cleanOldRecordings() {
   DIR *dir = opendir("/sdcard/meetings");
   if (!dir) {
@@ -1200,20 +1215,85 @@ void writeWavHeader(uint8_t* buffer, uint32_t dataSize) {
   memcpy(buffer + 40, &dataSize, 4);
 }
 
-bool streamFileToBackend(const char* filepath) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  
-  // Disable power save to prevent dropped packets, but lower TX power 
+// "HTTP/1.1 202 ACCEPTED" -> 202; anything else -> -1
+int parseHttpStatus(const String &line) {
+  if (!line.startsWith("HTTP/")) return -1;
+  int sp = line.indexOf(' ');
+  if (sp == -1) return -1;
+  return line.substring(sp + 1, sp + 4).toInt();
+}
+
+// Waits for the next status line, or returns "" on timeout or a closed connection.
+String readStatusLine(WiFiClient &client, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() > 0) return line;
+    } else if (!client.connected()) {
+      break;
+    }
+    delay(10);
+  }
+  return "";
+}
+
+// Consumes the headers and a small JSON body after a status line, and extracts error_code.
+void readResponseRest(WiFiClient &client, unsigned long timeoutMs, String &errorCode) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs && (client.connected() || client.available())) {
+    if (client.available()) {
+      String line = client.readStringUntil('\n');
+      if (line == "\r" || line.length() == 0) break;
+    } else {
+      delay(10);
+    }
+  }
+  char body[512] = {0};
+  size_t len = 0;
+  start = millis();
+  while (millis() - start < timeoutMs && len < sizeof(body) - 1 && (client.connected() || client.available())) {
+    if (client.available()) {
+      body[len++] = (char)client.read();
+    } else {
+      delay(10);
+    }
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, body) == DeserializationError::Ok) {
+    errorCode = doc["error_code"] | "";
+  }
+}
+
+UploadResult classifyUploadResponse(int status, const String &errorCode) {
+  if (status == 200 || status == 202) return UPLOAD_OK;
+  if (status == 409) {
+    if (errorCode == "duplicate") return UPLOAD_OK;               // Server already has this recording
+    if (errorCode == "recording_conflict") return UPLOAD_REJECTED;
+    return UPLOAD_RETRY_LATER;                                    // e.g. upload_in_progress
+  }
+  if (status == 401 && errorCode == "clock_skew") return UPLOAD_CLOCK_SKEW;
+  if (status == 400 && errorCode == "hash_mismatch") return UPLOAD_RETRY_LATER; // SD read glitch: re-hash next attempt
+  if (status == 408 || status == 429 || status == 507 || status >= 500 || status < 0) return UPLOAD_RETRY_LATER;
+  return UPLOAD_REJECTED;
+}
+
+UploadResult streamFileToBackend(const char* filepath) {
+  if (WiFi.status() != WL_CONNECTED) return UPLOAD_RETRY_LATER;
+
+  // Disable power save to prevent dropped packets, but lower TX power
   // to 8.5dBm to prevent 3.3V rail brownouts during SD card reads.
+  // Applied before the SHA-256 pass: hashing is a full SD read of the recording too.
   WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
     WiFi.setSleep(true);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    return false;
+    return UPLOAD_RETRY_LATER;
   }
 
   fseek(f, 0, SEEK_END);
@@ -1258,60 +1338,53 @@ bool streamFileToBackend(const char* filepath) {
 
   String signature = computeHMACSHA256(canonical, hmac_secret);
 
+  int status = -1;
+  String errorCode = "";
   WiFiClient client;
   client.setTimeout(30000); 
 
-  if (!client.connect(host.c_str(), port)) {
-    fclose(f);
-    WiFi.setSleep(true);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    return false;
-  }
-
-  client.print("POST /api/upload HTTP/1.1\r\n");
-  client.print("Host: " + host + "\r\n");
-  client.print("Content-Type: audio/wav\r\n");
-  client.print("Content-Length: " + String(fileSize) + "\r\n");
-  client.print("Expect: 100-continue\r\n");
-  client.print("X-Device-Id: " + String(device_id) + "\r\n");
-  client.print("X-Key-Id: " + String(key_id) + "\r\n");
-  client.print("X-Request-Id: " + request_id + "\r\n");
-  client.print("X-Recording-Id: " + String(current_recording_id) + "\r\n");
-  client.print("X-Recording-Started-At: " + String(file_recording_started_at) + "\r\n");
-  client.print("X-Clock-Valid: " + String(current_clock_valid) + "\r\n");
-  client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
-  client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
-  client.print("X-Signature: " + signature + "\r\n");
-  client.print("Connection: close\r\n\r\n");
-
-  unsigned long waitStart = millis();
-  bool sendBody = true;
-  String responseHeaders = "";
-  
-  while (millis() - waitStart < 5000) {
-    if (client.available()) {
-      responseHeaders = client.readStringUntil('\n');
-      if (responseHeaders.indexOf("100 Continue") != -1) {
-        while (client.available() && client.readStringUntil('\n') != "\r");
-        sendBody = true;
-        break;
-      } else if (responseHeaders.indexOf("HTTP/") != -1 && responseHeaders.indexOf(" 200") == -1 && responseHeaders.indexOf(" 202") == -1) {
-        sendBody = false;
-        break;
-      }
+  if (client.connect(host.c_str(), port)) {
+    client.print("POST /api/upload HTTP/1.1\r\n");
+    client.print("Host: " + host + "\r\n");
+    client.print("Content-Type: audio/wav\r\n");
+    client.print("Content-Length: " + String(fileSize) + "\r\n");
+    client.print("Expect: 100-continue\r\n");
+    client.print("X-Device-Id: " + String(device_id) + "\r\n");
+    client.print("X-Key-Id: " + String(key_id) + "\r\n");
+    client.print("X-Request-Id: " + request_id + "\r\n");
+    if (strlen(current_recording_id) > 0) {
+      client.print("X-Recording-Id: " + String(current_recording_id) + "\r\n");
     }
-    delay(10);
-  }
+    client.print("X-Recording-Started-At: " + String(file_recording_started_at) + "\r\n");
+    client.print("X-Clock-Valid: " + String(current_clock_valid) + "\r\n");
+    client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
+    client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
+    client.print("X-Signature: " + signature + "\r\n");
+    client.print("Connection: close\r\n\r\n");
 
-  if (sendBody) {
-    uint8_t *sendBuf = (uint8_t*)malloc(AUDIO_FRAME_SIZE); // Uses global AUDIO_FRAME_SIZE
-    if (sendBuf) {
-      size_t remaining = fileSize;
-      while (remaining > 0) {
-        size_t toRead = (remaining > AUDIO_FRAME_SIZE) ? AUDIO_FRAME_SIZE : remaining;
-        size_t bytesRead = fread(sendBuf, 1, toRead, f);
-        
-        if (bytesRead > 0) {
+    // The server answers 100 Continue once the headers pass, or a final status (401, 409, duplicate 202...)
+    // without reading the body. No answer within 5 s means it ignores Expect, so send the body anyway.
+    String firstLine = readStatusLine(client, 5000);
+    int firstStatus = parseHttpStatus(firstLine);
+    bool sendBody = (firstLine.length() == 0 || firstStatus == 100);
+
+    if (firstStatus == 100) {
+      while (client.available() && client.readStringUntil('\n') != "\r");
+    } else if (firstStatus > 0) {
+      status = firstStatus;
+      readResponseRest(client, 5000, errorCode);
+    }
+
+    if (sendBody) {
+      bool bodyComplete = false;
+      uint8_t *sendBuf = (uint8_t*)malloc(AUDIO_FRAME_SIZE); // Uses global AUDIO_FRAME_SIZE
+      if (sendBuf) {
+        size_t remaining = fileSize;
+        while (remaining > 0) {
+          size_t toRead = (remaining > AUDIO_FRAME_SIZE) ? AUDIO_FRAME_SIZE : remaining;
+          size_t bytesRead = fread(sendBuf, 1, toRead, f);
+          if (bytesRead == 0) break; // File read error
+
           // Robust retry loop for Wi-Fi buffer congestion
           size_t written = 0;
           int retries = 0;
@@ -1325,47 +1398,50 @@ bool streamFileToBackend(const char* filepath) {
               delay(50); // Yield to LwIP network stack to free TX buffers
             }
           }
-          
-          if (written < bytesRead) {
-            break; // Hard disconnect after 1 full second of failure, exit cleanly
-          }
-          
+          if (written < bytesRead) break; // Hard disconnect after 1 full second of failure
+
           remaining -= bytesRead;
           delay(2); // Keep watchdog alive
-        } else {
-          break; // File read error
         }
+        bodyComplete = (remaining == 0);
+        free(sendBuf);
       }
-      free(sendBuf);
-    }
-  } else {
-    fclose(f);
-    client.stop();
-    WiFi.setSleep(true);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
-    return false;
-  }
-  
-  fclose(f);
 
-  unsigned long timeout = millis();
-  bool got202 = false;
-  while (client.connected() && millis() - timeout < 5000) {
-    if (client.available()) {
-      String line = client.readStringUntil('\n');
-      if (line.indexOf("HTTP/") != -1 && (line.indexOf(" 202 ") != -1 || line.indexOf(" 200 ") != -1)) {
-        got202 = true;
+      if (bodyComplete) {
+        // Skip a late interim 100 Continue if the body went out before it arrived
+        String line = readStatusLine(client, 10000);
+        if (parseHttpStatus(line) == 100) {
+          while (client.available() && client.readStringUntil('\n') != "\r");
+          line = readStatusLine(client, 10000);
+        }
+        status = parseHttpStatus(line);
+        if (status > 0) readResponseRest(client, 5000, errorCode);
       }
     }
-    delay(10);
+    client.stop();
   }
-  client.stop();
+  fclose(f);
   
   // Re-enable power save mode and restore maximum TX power
   WiFi.setSleep(true); 
   WiFi.setTxPower(WIFI_POWER_19_5dBm);
   
-  return got202;
+  return classifyUploadResponse(status, errorCode);
+}
+
+// Uploads one recording and renames it by outcome. A clock_skew rejection gets one NTP resync and retry.
+UploadResult uploadRecordingFile(String &wavPath) {
+  UploadResult result = streamFileToBackend(wavPath.c_str());
+  if (result == UPLOAD_CLOCK_SKEW && syncNTP()) {
+    result = streamFileToBackend(wavPath.c_str());
+  }
+
+  const char *status = (result == UPLOAD_OK) ? "OK" : (result == UPLOAD_REJECTED) ? "rejected" : "failed";
+  String newPath = withRecordingStatus(wavPath, status);
+  if (newPath != wavPath && rename(wavPath.c_str(), newPath.c_str()) == 0) {
+    wavPath = newPath;
+  }
+  return result;
 }
 
 void drawMeetingAssistantUI(const char* extraStatus = NULL) {
@@ -1469,35 +1545,35 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
   pushCanvasToRLCD(false);
 }
 
+const char* uploadResultMessage(UploadResult result) {
+  switch (result) {
+    case UPLOAD_OK:       return "Saved & Transmitted!";
+    case UPLOAD_REJECTED: return "Rejected by server (kept)";
+    default:              return "Upload Failed (will retry)";
+  }
+}
+
 void processFailedUploads() {
+  // Collect names first: renaming entries while readdir() walks the FAT directory can skip files
   DIR *dir = opendir("/sdcard/meetings");
   if (!dir) return;
-
-  bool hadFailedUploads = false;
+  std::vector<String> failed;
   struct dirent *entry;
   while ((entry = readdir(dir)) != NULL) {
     String fname = String(entry->d_name);
-    if (fname.endsWith("_failed.wav")) {
-      hadFailedUploads = true;
-      String fullPath = String("/sdcard/meetings/") + fname;
-      String shortName = fname.substring(9, 15);
-      drawMeetingAssistantUI(("Syncing " + shortName + "...").c_str());
-      
-      if (streamFileToBackend(fullPath.c_str())) {
-        String newName = fullPath;
-        newName.replace("_failed.wav", "_OK.wav");
-        rename(fullPath.c_str(), newName.c_str());
-        drawMeetingAssistantUI("Saved & Transmitted!");
-      }
-    }
+    if (fname.endsWith("_failed.wav")) failed.push_back(fname);
   }
   closedir(dir);
 
-  if (hadFailedUploads) {
-    drawMeetingAssistantUI("All syncs complete!");
-  } else {
-    drawMeetingAssistantUI("Saved & Transmitted!");
+  for (const String &fname : failed) {
+    String fullPath = String("/sdcard/meetings/") + fname;
+    String shortName = fname.substring(9, 15);
+    drawMeetingAssistantUI(("Syncing " + shortName + "...").c_str());
+    UploadResult result = uploadRecordingFile(fullPath);
+    drawMeetingAssistantUI(uploadResultMessage(result));
   }
+
+  drawMeetingAssistantUI(failed.empty() ? "Saved & Transmitted!" : "All syncs complete!");
 }
 
 void startMeetingRecording() {
@@ -1562,31 +1638,21 @@ void stopMeetingRecording() {
   setLowPowerClock(false); // Boost CPU for high-speed transmission
   bool connected = ensureWiFiConnected(6);
 
+  String meetingPath = String(currentMeetingFileName);
   if (connected) {
     drawMeetingAssistantUI("Syncing to Mac...");
-    bool success = streamFileToBackend(currentMeetingFileName);
-    if (success) {
-      String okName = String(currentMeetingFileName);
-      okName.replace("_pending.wav", "_OK.wav");
-      rename(currentMeetingFileName, okName.c_str());
-      strncpy(currentMeetingFileName, okName.c_str(), sizeof(currentMeetingFileName) - 1);
-      currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
-      drawMeetingAssistantUI("Saved & Transmitted!");
+    UploadResult result = uploadRecordingFile(meetingPath);
+    strncpy(currentMeetingFileName, meetingPath.c_str(), sizeof(currentMeetingFileName) - 1);
+    currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
+    drawMeetingAssistantUI(uploadResultMessage(result));
+    if (result == UPLOAD_OK) {
       processFailedUploads();
-    } else {
-      drawMeetingAssistantUI("Upload Failed (5XX/Offline)");
-      String failedName = String(currentMeetingFileName);
-      failedName.replace("_pending.wav", "_failed.wav");
-      rename(currentMeetingFileName, failedName.c_str());
-      strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
-      currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     }
     disableWiFi(); // Immediately shut down Wi-Fi after transmission concludes
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
-    String failedName = String(currentMeetingFileName);
-    failedName.replace("_pending.wav", "_failed.wav");
-    rename(currentMeetingFileName, failedName.c_str());
+    String failedName = withRecordingStatus(meetingPath, "failed");
+    rename(meetingPath.c_str(), failedName.c_str());
     strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
     currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     disableWiFi(); // Power down Wi-Fi if connection attempt fails
