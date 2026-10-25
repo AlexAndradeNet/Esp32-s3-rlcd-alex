@@ -188,7 +188,7 @@ def get_ops_summary():
     conn.close()
     return jsonify({"state_counts": {row["state"]: row["count"] for row in counts}})
 
-DASHBOARD_HTML = """
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
