@@ -162,6 +162,7 @@ bool obtainCoordinates(float &lat, float &lon);
 bool queryBigDataCloudCity();
 bool syncNTP();
 void updateOpenMeteo();
+void processFailedUploads();
 
 // ================= CRYPTOGRAPHY & ID GENERATION =================
 String generateUUIDv4() {
@@ -1197,6 +1198,24 @@ bool streamFileToBackend(const char* filepath) {
   String request_id = generateUUIDv4();
   unsigned long request_timestamp = time(NULL);
 
+  unsigned long file_recording_started_at = current_recording_started_at;
+  const char* fname = strrchr(filepath, '/');
+  if (fname != NULL) {
+    fname++; // Skip the '/' character
+    int yr, mon, dy, hr, mn, sc;
+    if (sscanf(fname, "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
+      struct tm ftime;
+      memset(&ftime, 0, sizeof(ftime));
+      ftime.tm_year = yr - 1900;
+      ftime.tm_mon  = mon - 1;
+      ftime.tm_mday = dy;
+      ftime.tm_hour = hr;
+      ftime.tm_min  = mn;
+      ftime.tm_sec  = sc;
+      file_recording_started_at = mktime(&ftime);
+    }
+  }
+
   // 5-field HMAC Signature matching the backend requirement
   String canonical = String(device_id) + "\n" +
                      String(key_id) + "\n" +
@@ -1225,7 +1244,7 @@ bool streamFileToBackend(const char* filepath) {
   client.print("X-Key-Id: " + String(key_id) + "\r\n");
   client.print("X-Request-Id: " + request_id + "\r\n");
   client.print("X-Recording-Id: " + String(current_recording_id) + "\r\n");
-  client.print("X-Recording-Started-At: " + String(current_recording_started_at) + "\r\n");
+  client.print("X-Recording-Started-At: " + String(file_recording_started_at) + "\r\n");
   client.print("X-Clock-Valid: " + String(current_clock_valid) + "\r\n");
   client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
   client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
@@ -1301,7 +1320,7 @@ bool streamFileToBackend(const char* filepath) {
   while (client.connected() && millis() - timeout < 5000) {
     if (client.available()) {
       String line = client.readStringUntil('\n');
-      if (line.indexOf("HTTP/") != -1 && line.indexOf(" 202 ") != -1) {
+      if (line.indexOf("HTTP/") != -1 && (line.indexOf(" 202 ") != -1 || line.indexOf(" 200 ") != -1)) {
         got202 = true;
       }
     }
@@ -1417,10 +1436,41 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
   pushCanvasToRLCD(false);
 }
 
+void processFailedUploads() {
+  DIR *dir = opendir("/sdcard/meetings");
+  if (!dir) return;
+
+  bool hadFailedUploads = false;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    String fname = String(entry->d_name);
+    if (fname.endsWith("_failed.wav")) {
+      hadFailedUploads = true;
+      String fullPath = String("/sdcard/meetings/") + fname;
+      String shortName = fname.substring(9, 15);
+      drawMeetingAssistantUI(("Syncing " + shortName + "...").c_str());
+      
+      if (streamFileToBackend(fullPath.c_str())) {
+        String newName = fullPath;
+        newName.replace("_failed.wav", "_OK.wav");
+        rename(fullPath.c_str(), newName.c_str());
+        drawMeetingAssistantUI("Saved & Transmitted!");
+      }
+    }
+  }
+  closedir(dir);
+
+  if (hadFailedUploads) {
+    drawMeetingAssistantUI("All syncs complete!");
+  } else {
+    drawMeetingAssistantUI("Saved & Transmitted!");
+  }
+}
+
 void startMeetingRecording() {
   if (sdCardError) return;
 
-  sprintf(currentMeetingFileName, "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d.wav",
+  sprintf(currentMeetingFileName, "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d_pending.wav",
           rtc.getYear(), rtc.getMonth(), rtc.getDay(),
           rtc.getHour(), rtc.getMinute(), rtc.getSecond());
 
@@ -1483,13 +1533,29 @@ void stopMeetingRecording() {
     drawMeetingAssistantUI("Syncing to Mac...");
     bool success = streamFileToBackend(currentMeetingFileName);
     if (success) {
+      String okName = String(currentMeetingFileName);
+      okName.replace("_pending.wav", "_OK.wav");
+      rename(currentMeetingFileName, okName.c_str());
+      strncpy(currentMeetingFileName, okName.c_str(), sizeof(currentMeetingFileName) - 1);
+      currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
       drawMeetingAssistantUI("Saved & Transmitted!");
+      processFailedUploads();
     } else {
-      drawMeetingAssistantUI("Upload Failed (No 202)");
+      drawMeetingAssistantUI("Upload Failed (5XX/Offline)");
+      String failedName = String(currentMeetingFileName);
+      failedName.replace("_pending.wav", "_failed.wav");
+      rename(currentMeetingFileName, failedName.c_str());
+      strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
+      currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     }
     disableWiFi(); // Immediately shut down Wi-Fi after transmission concludes
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
+    String failedName = String(currentMeetingFileName);
+    failedName.replace("_pending.wav", "_failed.wav");
+    rename(currentMeetingFileName, failedName.c_str());
+    strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
+    currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     disableWiFi(); // Power down Wi-Fi if connection attempt fails
   }
 }
