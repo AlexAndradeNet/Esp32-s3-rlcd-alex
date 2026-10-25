@@ -5,7 +5,6 @@
 #include "esp_sleep.h"
 #include "driver/gpio.h"
 #include "font.h"
-#include "secfont.h"
 #include "qrcode.h"
 
 // Expose internal handle for SHTC3 ESP-IDF calls
@@ -410,7 +409,7 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
 void saveWiFiTxtConfig() {
   FILE *f = fopen("/sdcard/config_wifi.txt", "w");
   if (f) {
-    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\nmac_server=%s\n", wifi_ssid, wifi_pass, mac_server);
+    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\n", wifi_ssid, wifi_pass);
     fclose(f);
   } else {
     sdCardError = true;
