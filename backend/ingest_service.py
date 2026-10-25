@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, jsonify
+from werkzeug.serving import WSGIRequestHandler
 from dotenv import load_dotenv
 from db import init_db, recover_on_startup, get_db_connection, get_current_transcript, STAGING_DIR, AUDIO_DIR
 
@@ -16,7 +17,34 @@ load_dotenv()
 app = Flask("IngestService")
 
 init_db()
-ALLOWED_TIMESTAMP_DRIFT_SEC = 300 
+ALLOWED_TIMESTAMP_DRIFT_SEC = 300
+
+EXPECT_100_ENV_KEY = "meeting_companion.expect_100"
+
+class DeferredContinueRequestHandler(WSGIRequestHandler):
+    """Werkzeug writes '100 Continue' in run_wsgi() before the app runs, so a rejected
+    request would still upload its whole body. Hide the Expect header from Werkzeug and
+    let upload_audio() send the 100 Continue only after every header check has passed."""
+    def handle_expect_100(self):
+        return True
+
+    def run_wsgi(self):
+        self._expect_100 = self.headers.get("Expect", "").lower().strip(" \t") == "100-continue"
+        if self._expect_100:
+            del self.headers["Expect"]
+        super().run_wsgi()
+
+    def make_environ(self):
+        environ = super().make_environ()
+        environ[EXPECT_100_ENV_KEY] = getattr(self, "_expect_100", False)
+        return environ
+
+def send_100_continue_if_expected():
+    if not request.environ.get(EXPECT_100_ENV_KEY):
+        return
+    sock = request.environ.get("werkzeug.socket")
+    if sock:
+        sock.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
 
 def require_device_hmac(f):
     @wraps(f)
@@ -104,6 +132,9 @@ def upload_audio():
             return jsonify({"job_id": job_id, "status": state, "duplicate": True, "error_code": existing_job["last_error_code"]}), 409
         else:
             return jsonify({"job_id": job_id, "status": state, "duplicate": True}), 202
+
+    # All header checks passed: only now let the client start sending the body
+    send_100_continue_if_expected()
 
     job_id = str(uuid.uuid4())
     staging_path = os.path.join(STAGING_DIR, f"{job_id}.part")
@@ -299,5 +330,6 @@ if __name__ == "__main__":
 
     port = int(os.getenv("INGEST_PORT", 8443))
     print(f"Starting Ingest Service on http://0.0.0.0:{port} (Debug: {args.debug}) ...")
-    
-    app.run(host="0.0.0.0", port=port, debug=args.debug, use_reloader=False)
+
+    app.run(host="0.0.0.0", port=port, debug=args.debug, use_reloader=False,
+            request_handler=DeferredContinueRequestHandler)
