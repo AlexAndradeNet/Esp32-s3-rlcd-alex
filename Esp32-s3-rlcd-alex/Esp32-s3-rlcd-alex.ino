@@ -131,9 +131,6 @@ char weather_label[24] = "Fair";
 char device_id[64] = "";
 char key_id[64] = "";
 char hmac_secret[128] = "";
-char current_recording_id[64] = "";
-unsigned long current_recording_started_at = 0;
-int current_clock_valid = 0;
 
 // ---------- UPLOAD OUTCOMES ----------
 enum UploadResult {
@@ -148,7 +145,7 @@ uint8_t frame_buffer[AUDIO_FRAME_SIZE];
 bool isRecording = false;
 bool sdCardError = false; // Flagged if 0x107 or write failure occurs
 FILE *currentMeetingFile = NULL;
-char currentMeetingFileName[64] = "";
+char currentMeetingFileName[128] = ""; // ~85 chars: /sdcard/meetings/ + timestamp + UUID + clock flag + status
 uint32_t totalRecordedBytes = 0;
 unsigned long recordingStartTime = 0;
 unsigned long lastTimerScreenUpdate = 0;
@@ -796,10 +793,30 @@ void loadSDConfigs() {
   loadSDClockConfig();
 }
 
+// ================= RECORDING FILES: FILESYSTEM AS STATE MACHINE =================
+// Recordings are /sdcard/meetings/YYYYMMDD_HHMMSS_<recording_id>_c<0|1>_<status>.wav
+// with status pending -> OK | failed | rejected. The filename is the whole state: the identity and clock
+// validity are fixed when fopen() creates the file, and the status only changes through rename(), which
+// is atomic on FAT. There is no RAM tracking and no manifest that a brownout could leave half-written.
+// Legacy names (YYYYMMDD_HHMMSS_<status>.wav) carry no recording_id.
 String withRecordingStatus(const String &wavPath, const char *status) {
   int us = wavPath.lastIndexOf('_');
   if (us == -1) return wavPath;
   return wavPath.substring(0, us) + "_" + status + ".wav";
+}
+
+// Reads recording_id and clock validity back from the filename; false for legacy names.
+bool parseRecordingIdentity(const String &wavPath, String &recordingId, int &clockValid) {
+  int slash = wavPath.lastIndexOf('/');
+  String name = wavPath.substring(slash + 1);
+  // YYYYMMDD_HHMMSS_ = 16 chars, UUID = 36 chars, then "_c?_" and the status
+  if (name.length() < 57 || name.charAt(15) != '_' || name.charAt(52) != '_' ||
+      name.charAt(53) != 'c' || name.charAt(55) != '_') {
+    return false;
+  }
+  recordingId = name.substring(16, 52);
+  clockValid = (name.charAt(54) == '1') ? 1 : 0;
+  return true;
 }
 
 void cleanOldRecordings() {
@@ -1311,22 +1328,26 @@ UploadResult streamFileToBackend(const char* filepath) {
   String request_id = generateUUIDv4();
   unsigned long request_timestamp = time(NULL);
 
-  unsigned long file_recording_started_at = current_recording_started_at;
+  // Identity comes from the filename fixed at recording start, so every retry sends the same values.
+  // Legacy names have no ID: the header is omitted and the server derives it from device_id + start time.
+  String recording_id = "";
+  int file_clock_valid = 0;
+  parseRecordingIdentity(String(filepath), recording_id, file_clock_valid);
+
+  unsigned long file_recording_started_at = 0;
   const char* fname = strrchr(filepath, '/');
-  if (fname != NULL) {
-    fname++; // Skip the '/' character
-    int yr, mon, dy, hr, mn, sc;
-    if (sscanf(fname, "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
-      struct tm ftime;
-      memset(&ftime, 0, sizeof(ftime));
-      ftime.tm_year = yr - 1900;
-      ftime.tm_mon  = mon - 1;
-      ftime.tm_mday = dy;
-      ftime.tm_hour = hr;
-      ftime.tm_min  = mn;
-      ftime.tm_sec  = sc;
-      file_recording_started_at = mktime(&ftime);
-    }
+  fname = fname ? fname + 1 : filepath;
+  int yr, mon, dy, hr, mn, sc;
+  if (sscanf(fname, "%4d%2d%2d_%2d%2d%2d", &yr, &mon, &dy, &hr, &mn, &sc) == 6) {
+    struct tm ftime;
+    memset(&ftime, 0, sizeof(ftime));
+    ftime.tm_year = yr - 1900;
+    ftime.tm_mon  = mon - 1;
+    ftime.tm_mday = dy;
+    ftime.tm_hour = hr;
+    ftime.tm_min  = mn;
+    ftime.tm_sec  = sc;
+    file_recording_started_at = mktime(&ftime);
   }
 
   // 5-field HMAC Signature matching the backend requirement
@@ -1352,11 +1373,11 @@ UploadResult streamFileToBackend(const char* filepath) {
     client.print("X-Device-Id: " + String(device_id) + "\r\n");
     client.print("X-Key-Id: " + String(key_id) + "\r\n");
     client.print("X-Request-Id: " + request_id + "\r\n");
-    if (strlen(current_recording_id) > 0) {
-      client.print("X-Recording-Id: " + String(current_recording_id) + "\r\n");
+    if (recording_id.length() > 0) {
+      client.print("X-Recording-Id: " + recording_id + "\r\n");
     }
     client.print("X-Recording-Started-At: " + String(file_recording_started_at) + "\r\n");
-    client.print("X-Clock-Valid: " + String(current_clock_valid) + "\r\n");
+    client.print("X-Clock-Valid: " + String(file_clock_valid) + "\r\n");
     client.print("X-Request-Timestamp: " + String(request_timestamp) + "\r\n");
     client.print("X-Content-SHA256: " + content_sha256 + "\r\n");
     client.print("X-Signature: " + signature + "\r\n");
@@ -1536,9 +1557,12 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
     } else if (strlen(currentMeetingFileName) > 0) {
       canvas.setFont(&FreeSansBold9pt7b);
       canvas.setCursor(20, 235);
-      canvas.print("Last: ");
-      const char *shortName = strrchr(currentMeetingFileName, '/');
-      canvas.print(shortName ? shortName + 1 : currentMeetingFileName);
+      // The full name (with the recording_id) is too wide for the screen: show "YYYYMMDD_HHMMSS (status)"
+      String lastName = String(currentMeetingFileName);
+      lastName = lastName.substring(lastName.lastIndexOf('/') + 1);
+      String lastStatus = lastName.substring(lastName.lastIndexOf('_') + 1);
+      lastStatus.replace(".wav", "");
+      canvas.print("Last: " + lastName.substring(0, 15) + " (" + lastStatus + ")");
     }
   }
 
@@ -1579,9 +1603,13 @@ void processFailedUploads() {
 void startMeetingRecording() {
   if (sdCardError) return;
 
-  sprintf(currentMeetingFileName, "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d_pending.wav",
-          rtc.getYear(), rtc.getMonth(), rtc.getDay(),
-          rtc.getHour(), rtc.getMinute(), rtc.getSecond());
+  // The identity is part of the name from the moment the file exists, so every retry
+  // (even after a reboot) sends the same recording_id
+  snprintf(currentMeetingFileName, sizeof(currentMeetingFileName),
+           "/sdcard/meetings/%04d%02d%02d_%02d%02d%02d_%s_c%d_pending.wav",
+           rtc.getYear(), rtc.getMonth(), rtc.getDay(),
+           rtc.getHour(), rtc.getMinute(), rtc.getSecond(),
+           generateUUIDv4().c_str(), clockSyncedSinceBoot ? 1 : 0);
 
   currentMeetingFile = fopen(currentMeetingFileName, "wb");
   if (!currentMeetingFile) {
@@ -1599,10 +1627,6 @@ void startMeetingRecording() {
     return;
   }
 
-  strncpy(current_recording_id, generateUUIDv4().c_str(), sizeof(current_recording_id) - 1);
-  current_recording_id[sizeof(current_recording_id) - 1] = '\0';
-  current_recording_started_at = time(NULL); 
-  current_clock_valid = (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) ? 1 : 0;
 
   totalRecordedBytes = 0;
   recordingStartTime = millis();
