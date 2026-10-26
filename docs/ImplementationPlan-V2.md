@@ -11,6 +11,8 @@ Lessons from building v1 are in `docs/learned_lessons_v1.md`.
 
 ### **Changelog**
 
+**v2.4.2 (2026-10-26):** documentation only. New §1.1 explains why the recorder is a dedicated device rather than a phone app.
+
 **v2.4.1 (2026-10-25):** Bluetooth is explicitly off. `btStop()` runs in `setup()` and at record start. It was never started before this either, so this is a guard against future libraries, not a behavior change.
 
 **v2.4 (2026-10-25): quiet recording.** While a recording runs, only the microphones are on (§18.2):
@@ -68,6 +70,29 @@ A small backend on a Mac Mini (Apple Silicon) that:
 **Main change from v1:** the system is now **fully local at runtime**. v1 sent the transcript to Claude for structured extraction. The current code uses an on-device MLX LLM, and the backend makes no outbound calls. The `anthropic` package and `CLAUDE_API_KEY` are still in `requirements.txt` and `example.env`, but no code uses them (§10.2).
 
 The device is also a desk clock. It shows a calendar, weather, local temperature and humidity, and battery level. The meeting recorder is one of its three screens (§18).
+
+### **1.1 Why a dedicated device instead of a phone app**
+
+A phone is the more capable platform: better microphones and battery, and no hardware to buy. The dedicated device was chosen anyway, for two reasons:
+
+* **Learning:** hands-on practice with embedded hardware and an edge-to-local AI pipeline was an explicit goal of the project.
+* **A different product:** a single-purpose companion that lives on the desk.
+
+| | Phone app | Dedicated desk device |
+| ----- | ----- | ----- |
+| Hardware already owned | Yes | No |
+| Microphones, battery, connectivity | Better | Adequate for speech (16 kHz µ-law) |
+| Start a recording | Unlock, open the app, dismiss notifications | One physical button on the Meeting screen (§18.1) |
+| No network | Depends on the app | Records to SD; the file waits as `_failed` until the Mini is reachable (§18.2) |
+| Moving the file to the transcriber | Often manual: share, upload, copy | Automatic signed upload when recording stops, retried later (§18.3) |
+| During the meeting | A personal device on the table | Radio, speaker and sensors off; only the microphones run (§18.2) |
+| Development effort | Lower | Higher |
+
+**Limits of the device today:**
+* `_failed` uploads are retried only after the next successful upload, not on a timer (§21, P0-1).
+* The device has not been validated on the board since the v2 changes (§22).
+
+**Not a dead end:** the ingest API is a plain HTTP upload with an HMAC signature (§6) and doesn't depend on the device. A phone app could use the same backend unchanged.
 
 ## **2. Scope**
 
