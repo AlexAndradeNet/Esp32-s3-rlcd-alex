@@ -56,6 +56,25 @@ Add `--debug` to either one for Flask debug mode.
 * Device uploads: `http://<mac-mini-lan-ip>:8443/api/upload`
 * Dashboard: http://127.0.0.1:8080 (localhost only; use an SSH tunnel for remote access)
 
+## Tests
+
+```shell
+source venv/bin/activate
+python3.12 -m unittest discover -s tests -v
+```
+
+The tests need nothing beyond `requirements.txt`, and they don't touch your data:
+* **Sandbox:** each run uses a temporary folder with its own database, `audio/` and `staging/`, and a test device and secret.
+* **No models:** MLX Whisper and the LLM are replaced by stubs, so nothing is downloaded and a run takes a couple of seconds.
+
+| File | Covers |
+| ----- | ----- |
+| `test_ingest.py` | HMAC checks, clock skew, new uploads, recording IDs, duplicates and conflicts, digest mismatch, audio parked in `orphans/` when the DB insert fails |
+| `test_expect_continue.py` | A real Werkzeug server: `100 Continue` only after the header checks pass |
+| `test_recovery.py` | `recover_on_startup()` after a simulated crash |
+| `test_worker.py` | One worker pass, re-transcription using the current transcript, ASR failure |
+| `test_admin.py` | Audio playback (µ-law decoded to PCM, file untouched, 404/410), dashboard template |
+
 ## Data on disk
 
 | Path | Content |

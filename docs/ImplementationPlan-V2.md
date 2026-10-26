@@ -11,6 +11,8 @@ Lessons from building v1 are in `docs/learned_lessons_v1.md`.
 
 ### **Changelog**
 
+**v2.4.3 (2026-10-26): automated backend tests.** `backend/tests/` turns the §22 checks into 34 repeatable `unittest` tests that need no extra dependency (§22).
+
 **v2.4.2 (2026-10-26):** documentation only. New §1.1 explains why the recorder is a dedicated device rather than a phone app.
 
 **v2.4.1 (2026-10-25):** Bluetooth is explicitly off. `btStop()` runs in `setup()` and at record start. It was never started before this either, so this is a guard against future libraries, not a behavior change.
@@ -723,7 +725,7 @@ Unchanged from v1. None are in place. Also required: the v1 signature (§6.2 gap
 7. `F_FULLFSYNC`, and the v1 order of operations for the commit.
 8. WAV header validation, and size, duration, and disk limits.
 9. Store segments with timestamps. Pass `language`. Turn on VAD or `condition_on_previous_text=False`.
-10. Automated tests from the scratch checks in §22 (pytest for the backend, plus a host build of the firmware's pure helpers: `withRecordingStatus`, `classifyUploadResponse`, `parseHttpStatus`).
+10. Automated tests: the backend part is done (v2.4.3, `backend/tests/`, §22). Still open: a host build of the firmware's pure helpers (`withRecordingStatus`, `classifyUploadResponse`, `parseHttpStatus`).
 
 **P2 — security:**
 
@@ -744,7 +746,9 @@ Unchanged from v1. None are in place. Also required: the v1 signature (§6.2 gap
 
 ## **22. Verification**
 
-There are no automated tests in the repo yet. The v2.1 fixes were checked as follows.
+**Automated backend tests (since v2.4.3):** `backend/tests/`, run with `python3.12 -m unittest discover -s tests` from `backend/` (see `backend/README.md`). The 34 tests cover every backend row of the table below, plus authentication, digest mismatch, the orphan path when the DB insert fails, and audio playback. They run in a temporary sandbox with stubbed MLX models. To confirm they catch regressions, fixes 2 and 8 of v2.1 were reverted one at a time, and the matching test failed each time. The firmware still has no automated tests.
+
+The v2.1 fixes were first checked by hand, as follows.
 
 **Backend: run against copies of the services on a scratch database** (socket client for uploads, stubbed MLX modules for the worker):
 
