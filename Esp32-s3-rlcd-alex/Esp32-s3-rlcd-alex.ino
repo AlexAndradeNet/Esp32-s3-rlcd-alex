@@ -3,6 +3,7 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include "display_bsp.h"
 #include "esp_sleep.h"
+#include "driver/usb_serial_jtag.h"
 #include "driver/gpio.h"
 #include "font.h"
 #include "qrcode.h"
@@ -62,6 +63,7 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 static I2cMasterBus I2cbus(I2C_SCL, I2C_SDA, 0);
 CodecPort *codecport = NULL;
+bool usbDevMode = false;  // A computer was on the USB port at boot: never light sleep, so the USB console stays up
 bool codecActive = false; // True while ES8311/ES7210 and I2S are open (Screen 2 only)
 PCF85063A rtc;
 
@@ -2180,6 +2182,16 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // Light sleep drops the USB port every minute. If a computer is on the port at boot (it sends USB
+  // frames; a charger or power bank doesn't), this is a development session: stay awake until the next
+  // reset. The host may still be enumerating, so give it up to 1 s.
+  for (int i = 0; i < 20 && !usbDevMode; i++) {
+    usbDevMode = usb_serial_jtag_is_connected();
+    if (!usbDevMode) delay(50);
+  }
+  printf("[POWER] USB host %s at boot: light sleep %s\n",
+         usbDevMode ? "detected" : "not detected", usbDevMode ? "off (development)" : "on");
+
   // Bluetooth is never used. The core already skips starting it and frees its memory at boot
   // (no BT library is linked); this keeps the controller off even if a future library starts it.
   btStop();
@@ -2452,7 +2464,9 @@ void loop() {
   // Adaptive delay: 100ms idle delay on Clock Screen saves CPU cycles, 20ms elsewhere
   if (currentScreen == SCREEN_CLOCK && !isRecording) {
     delay(100);
-    enterClockLightSleep(); // Screen 1: sleep between minute ticks instead of polling
+    if (!usbDevMode) {
+      enterClockLightSleep(); // Screen 1: sleep between minute ticks instead of polling
+    }
   } else {
     delay(20);
   }
