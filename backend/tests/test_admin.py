@@ -87,10 +87,12 @@ class DashboardTests(unittest.TestCase):
             warnings.simplefilter("error")
             compile(source, admin_service.__file__, "exec")
 
-    def test_dashboard_has_the_listen_button(self):
+    def test_dashboard_plays_audio_only_in_the_report(self):
         response = admin_service.app.test_client().get("/dashboard")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Listen", response.data)
+        self.assertNotIn(b"Listen", response.data)
+        self.assertIn(b'id="reportAudio"', response.data)
+        self.assertIn(b"Download .wav", response.data)
 
 
 if __name__ == "__main__":

@@ -73,7 +73,7 @@ The tests need nothing beyond `requirements.txt`, and they don't touch your data
 | `test_expect_continue.py` | A real Werkzeug server: `100 Continue` only after the header checks pass, and a body cut short is discarded |
 | `test_recovery.py` | `recover_on_startup()` after a simulated crash |
 | `test_worker.py` | One worker pass, re-transcription using the current transcript, ASR failure |
-| `test_admin.py` | Audio playback (µ-law decoded to PCM, file untouched, 404/410), dashboard template |
+| `test_admin.py` | Audio playback (µ-law decoded to PCM, file untouched, 404/410), dashboard template (player only in the report) |
 
 ## Data on disk
 
@@ -88,7 +88,7 @@ The tests need nothing beyond `requirements.txt`, and they don't touch your data
 
 ## Listening to recordings
 
-Each job in the dashboard has a **Listen** button. Completed jobs also show the player in **View Report**. Both include a **Download .wav** link. µ-law recordings from the device are decoded to 16-bit PCM while they're served, so they play in any browser, and the stored file is not modified.
+Completed jobs have an audio player in **View Report**, with a **Download .wav** link. µ-law recordings from the device are decoded to 16-bit PCM while they're served, so they play in any browser, and the stored file is not modified.
 
 ## Job lifecycle
 

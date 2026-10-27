@@ -279,8 +279,6 @@ DASHBOARD_HTML = r"""
         button:hover { background: #0056b3; }
         .btn-view { background: #34c759; }
         .btn-view:hover { background: #248a3d; }
-        .btn-listen { background: #5856d6; }
-        .btn-listen:hover { background: #3f3db0; }
         .audio-block { margin-bottom: 20px; }
         .audio-block audio { width: 100%; display: none; margin-bottom: 8px; }
         .audio-download { display: none; color: #007aff; margin-right: 12px; }
@@ -341,20 +339,6 @@ DASHBOARD_HTML = r"""
         </div>
     </div>
 
-    <!-- Audio Modal (any job state: the recording exists from the moment it is accepted) -->
-    <div id="audioModal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeModal()">&times;</span>
-            <h2>Recording</h2>
-            <p><strong>Job ID:</strong> <span id="audioJobId"></span></p>
-            <div class="audio-block">
-                <audio id="listenAudio" controls preload="metadata"></audio>
-                <a id="listenAudioDownload" class="audio-download">Download .wav</a>
-                <span id="listenAudioStatus" class="audio-status"></span>
-            </div>
-        </div>
-    </div>
-
     <script>
         const AUTH_HEADER = { 'Authorization': 'Bearer dev-admin-token' };
 
@@ -403,7 +387,6 @@ DASHBOARD_HTML = r"""
                         <td>${formatClientTime(j.uploaded_at)}</td>
                         <td>
                             <button onclick="retryJob('${j.job_id}')">Retry</button>
-                            <button class="btn-listen" onclick="listenAudio('${j.job_id}')">Listen</button>
                             ${j.state === 'COMPLETED' ? `<button class="btn-view" onclick="viewReport('${j.job_id}')">View Report</button>` : ''}
                         </td>
                     `;
@@ -453,12 +436,10 @@ DASHBOARD_HTML = r"""
         let currentAudioUrl = null;
 
         function releaseAudio() {
-            ['reportAudio', 'listenAudio'].forEach(id => {
-                const player = document.getElementById(id);
-                player.pause();
-                player.removeAttribute('src');
-                player.load();
-            });
+            const player = document.getElementById('reportAudio');
+            player.pause();
+            player.removeAttribute('src');
+            player.load();
             if (currentAudioUrl) {
                 URL.revokeObjectURL(currentAudioUrl);
                 currentAudioUrl = null;
@@ -492,15 +473,8 @@ DASHBOARD_HTML = r"""
             }
         }
 
-        function listenAudio(jobId) {
-            document.getElementById('audioModal').style.display = 'block';
-            document.getElementById('audioJobId').innerText = jobId;
-            loadAudio(jobId, 'listenAudio', 'listenAudioDownload', 'listenAudioStatus');
-        }
-
         function closeModal() {
             document.getElementById('reportModal').style.display = 'none';
-            document.getElementById('audioModal').style.display = 'none';
             releaseAudio();
         }
 
