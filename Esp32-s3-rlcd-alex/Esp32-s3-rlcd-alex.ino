@@ -362,6 +362,41 @@ struct SdSafeRadio {
   }
 };
 
+// Rewrites path only when its content differs. The syncs save the config files every 15 minutes (every
+// minute while reconnecting), right after Wi-Fi connects at full power: a brownout during one of those
+// writes can corrupt the FAT. The content rarely changes, so this skips almost every write.
+// Returns false only when a needed write failed.
+bool writeFileIfChanged(const char *path, const char *content, size_t len) {
+  SdSafeRadio radioGuard; // Low TX power while this touches the SD card
+  FILE *f = fopen(path, "rb");
+  if (f) {
+    bool same = false;
+    if (fseek(f, 0, SEEK_END) == 0 && ftell(f) == (long)len) {
+      fseek(f, 0, SEEK_SET);
+      char buf[256];
+      size_t pos = 0;
+      same = true;
+      while (pos < len) {
+        size_t chunk = (len - pos > sizeof(buf)) ? sizeof(buf) : len - pos;
+        if (fread(buf, 1, chunk, f) != chunk || memcmp(buf, content + pos, chunk) != 0) {
+          same = false;
+          break;
+        }
+        pos += chunk;
+      }
+    }
+    fclose(f);
+    if (same) return true;
+  }
+
+  f = fopen(path, "wb");
+  if (!f) return false;
+  size_t written = fwrite(content, 1, len, f);
+  bool ok = (fclose(f) == 0) && (written == len);
+  printf("[CONFIG] %s %s\n", ok ? "Saved" : "Failed to save", path);
+  return ok;
+}
+
 bool readWiFiDatabase(JsonDocument &doc) {
   SdSafeRadio radioGuard; // Low TX power while this touches the SD card
   FILE *f = fopen("/sdcard/wifi_database.json", "r");
@@ -387,18 +422,9 @@ bool readWiFiDatabase(JsonDocument &doc) {
 }
 
 bool saveWiFiDatabase(JsonDocument &doc) {
-  FILE *f = fopen("/sdcard/wifi_database.json", "w");
-  if (!f) {
-    return false;
-  }
-  
   String jsonStr;
   serializeJsonPretty(doc, jsonStr);
-  
-  size_t written = fwrite(jsonStr.c_str(), 1, jsonStr.length(), f);
-  fclose(f);
-  
-  return (written == jsonStr.length());
+  return writeFileIfChanged("/sdcard/wifi_database.json", jsonStr.c_str(), jsonStr.length());
 }
 
 bool isInWiFiDatabase(const char* ssid) {
@@ -450,11 +476,9 @@ void appendWiFiDatabase(const char* essid, const char* pass, const char* city, f
 }
 
 void saveWiFiTxtConfig() {
-  FILE *f = fopen("/sdcard/config_wifi.txt", "w");
-  if (f) {
-    fprintf(f, "wifi_ssid=%s\nwifi_pass=%s\n", wifi_ssid, wifi_pass);
-    fclose(f);
-  } else {
+  char content[192]; // Fits the longest values the fields can hold
+  int len = snprintf(content, sizeof(content), "wifi_ssid=%s\nwifi_pass=%s\n", wifi_ssid, wifi_pass);
+  if (!writeFileIfChanged("/sdcard/config_wifi.txt", content, (size_t)len)) {
     sdCardError = true;
   }
 }
@@ -767,11 +791,10 @@ void loadSDClockConfig() {
 }
 
 void saveSDClockConfig() {
-  FILE *f = fopen("/sdcard/config_clock.txt", "w");
-  if (f) {
-    fprintf(f, "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\noverride=%s\n", city_name, latitude, longitude, gmt_offset, location_override);
-    fclose(f);
-  } else {
+  char content[192]; // Fits the longest values the fields can hold
+  int len = snprintf(content, sizeof(content), "city=%s\nlatitude=%s\nlongitude=%s\ngmt=%d\noverride=%s\n",
+                     city_name, latitude, longitude, gmt_offset, location_override);
+  if (!writeFileIfChanged("/sdcard/config_clock.txt", content, (size_t)len)) {
     sdCardError = true;
   }
 }
