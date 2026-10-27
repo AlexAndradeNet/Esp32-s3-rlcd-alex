@@ -1259,18 +1259,25 @@ void drawClockCalendarScreen() {
 
 // Fast 16-bit PCM to 8-bit G.711 Mu-law compressor
 inline uint8_t pcm16_to_ulaw(int16_t pcm_val) {
-  const int16_t BIAS = 0x84;
-  const int16_t CLIP = 32635;
-  int16_t sign = (pcm_val >> 8) & 0x80;
-  if (sign != 0) pcm_val = -pcm_val;
-  if (pcm_val > CLIP) pcm_val = CLIP;
-  pcm_val = (pcm_val + BIAS) >> 2;
+  // Standard G.711 (as in Sun's g711.c): bias the magnitude, find the segment from its top bit, and keep
+  // 4 mantissa bits below it. The older version shifted the sample right by 2 before the segment search,
+  // which mapped every level to the wrong segment (about 2 dB SNR instead of ~38 dB, speech ~4x too quiet).
+  const int BIAS = 0x84;
+  const int CLIP = 32635;
+  int sample = pcm_val; // int, not int16_t: -(-32768) would overflow
+  int sign = 0;
+  if (sample < 0) {
+    sample = -sample;
+    sign = 0x80;
+  }
+  if (sample > CLIP) sample = CLIP;
+  sample += BIAS;
 
-  int16_t exponent = 7;
-  for (int16_t expMask = 0x4000; (pcm_val & expMask) == 0 && exponent > 0; expMask >>= 1) {
+  int exponent = 7;
+  for (int expMask = 0x4000; (sample & expMask) == 0 && exponent > 0; expMask >>= 1) {
     exponent--;
   }
-  int16_t mantissa = (pcm_val >> (exponent + 3)) & 0x0F;
+  int mantissa = (sample >> (exponent + 3)) & 0x0F;
   return ~(uint8_t)(sign | (exponent << 4) | mantissa);
 }
 
