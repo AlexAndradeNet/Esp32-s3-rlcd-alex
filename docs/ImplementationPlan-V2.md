@@ -666,7 +666,7 @@ Headers sent: `Content-Type: audio/wav`, `Content-Length`, `Expect: 100-continue
 | ----- | ----- | ----- | ----- |
 | 200, 202, or 409 `duplicate` | `UPLOAD_OK` | `_OK.wav` | "Saved & Transmitted!" |
 | 401 `clock_skew` | `UPLOAD_CLOCK_SKEW` → `syncNTP()` and **one** retry. If the sync fails, the file is kept for a later retry | per the retry's result | — |
-| 400 `hash_mismatch`, 408, 409 (other codes), 429, 5xx, 507, timeout, no status | `UPLOAD_RETRY_LATER` | `_failed.wav` | "Upload Failed (will retry)" |
+| 400 `hash_mismatch`, 408, 409 (other codes), 429, 499, 5xx, 507, timeout, no status | `UPLOAD_RETRY_LATER` | `_failed.wav` | "Upload Failed (will retry)" |
 | 409 `recording_conflict`, other 4xx (400, 401, 411, 413, 415…) | `UPLOAD_REJECTED` | `_rejected.wav` (kept, never retried, never deleted) | "Rejected by server (kept)" |
 | No Wi-Fi | — | `_failed.wav` | "Saved to SD (Offline)" |
 

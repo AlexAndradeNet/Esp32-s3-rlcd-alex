@@ -189,7 +189,9 @@ String generateUUIDv4() {
   return String(buf);
 }
 
-String computeFileSHA256(const char* filepath) {
+// Returns "" unless all expectedSize bytes were read: a partial hash means the SD card failed mid-file,
+// and the upload must not start (the body read would fail the same way, after the server said 100 Continue).
+String computeFileSHA256(const char* filepath, long expectedSize) {
   FILE *f = fopen(filepath, "rb");
   if (!f) return "";
   mbedtls_md_context_t ctx;
@@ -199,12 +201,16 @@ String computeFileSHA256(const char* filepath) {
   
   // Heap allocation prevents Stack Overflow on large hashing
   uint8_t *buf = (uint8_t*)malloc(AUDIO_FRAME_SIZE);
+  long totalRead = 0;
+  bool readError = true;
   if (buf) {
     size_t bytesRead;
     while ((bytesRead = fread(buf, 1, AUDIO_FRAME_SIZE, f)) > 0) {
       mbedtls_md_update(&ctx, buf, bytesRead);
+      totalRead += bytesRead;
       delay(2); // Keep watchdog alive during big file hashes
     }
+    readError = ferror(f);
     free(buf);
   }
   
@@ -212,6 +218,10 @@ String computeFileSHA256(const char* filepath) {
   uint8_t digest[32];
   mbedtls_md_finish(&ctx, digest);
   mbedtls_md_free(&ctx);
+  if (readError || totalRead != expectedSize) {
+    printf("[UPLOAD] SD check failed: read %ld of %ld bytes of %s\n", totalRead, expectedSize, filepath);
+    return "";
+  }
   char hexBuf[65];
   for (int i = 0; i < 32; i++) sprintf(&hexBuf[i * 2], "%02x", digest[i]);
   return String(hexBuf);
@@ -1386,8 +1396,27 @@ UploadResult classifyUploadResponse(int status, const String &errorCode) {
   }
   if (status == 401 && errorCode == "clock_skew") return UPLOAD_CLOCK_SKEW;
   if (status == 400 && errorCode == "hash_mismatch") return UPLOAD_RETRY_LATER; // SD read glitch: re-hash next attempt
+  if (status == 499) return UPLOAD_RETRY_LATER; // Client Closed Request: the body was cut short, send it again
   if (status == 408 || status == 429 || status == 507 || status >= 500 || status < 0) return UPLOAD_RETRY_LATER;
   return UPLOAD_REJECTED;
+}
+
+// Hashes the whole recording (a full SD read) and sets fileSize. After one read timeout (0x107) the card
+// stays stuck in its data state and every later read fails until it is re-initialized, so on failure
+// remount it and try once more. Safe here: no file is open while a recording is being uploaded.
+String hashRecordingWithRetry(const char *filepath, long &fileSize) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      printf("[UPLOAD] Remounting the SD card and reading %s again\n", filepath);
+      if (!sdcardPort || !sdcardPort->SDPort_EnsureReady(true)) return "";
+    }
+    struct stat st;
+    if (stat(filepath, &st) != 0 || st.st_size <= 0) continue;
+    fileSize = st.st_size;
+    String sha = computeFileSHA256(filepath, fileSize);
+    if (sha.length() > 0) return sha;
+  }
+  return "";
 }
 
 UploadResult streamFileToBackend(const char* filepath) {
@@ -1399,6 +1428,18 @@ UploadResult streamFileToBackend(const char* filepath) {
   WiFi.setSleep(false);
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
+  // Read the whole file once before connecting: if the card can't, keep it as _failed for a later retry
+  // instead of opening a request the device can't finish. Hashed before the body handle is opened,
+  // so the retry can remount the card.
+  long fileSize = 0;
+  String content_sha256 = hashRecordingWithRetry(filepath, fileSize);
+  if (content_sha256.length() == 0) {
+    sdCardError = true; // Screen 2 shows it; checkSDCard() remounts the card before the next recording
+    WiFi.setSleep(true);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    return UPLOAD_RETRY_LATER;
+  }
+
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
@@ -1407,18 +1448,12 @@ UploadResult streamFileToBackend(const char* filepath) {
     return UPLOAD_RETRY_LATER;
   }
 
-  fseek(f, 0, SEEK_END);
-  long fileSize = ftell(f);
-  fseek(f, 0, SEEK_SET);
-
   String serverStr = String(mac_server);
   serverStr.replace("http://", "");
   serverStr.replace("https://", "");
   int colonIdx = serverStr.indexOf(':');
   String host = (colonIdx != -1) ? serverStr.substring(0, colonIdx) : serverStr;
   int port = (colonIdx != -1) ? serverStr.substring(colonIdx + 1).toInt() : 8443;
-
-  String content_sha256 = computeFileSHA256(filepath);
   String request_id = generateUUIDv4();
   unsigned long request_timestamp = time(NULL);
 
@@ -1498,7 +1533,12 @@ UploadResult streamFileToBackend(const char* filepath) {
         while (remaining > 0) {
           size_t toRead = (remaining > AUDIO_FRAME_SIZE) ? AUDIO_FRAME_SIZE : remaining;
           size_t bytesRead = fread(sendBuf, 1, toRead, f);
-          if (bytesRead == 0) break; // File read error
+          if (bytesRead == 0) {
+            // The card stopped answering mid-file: flag it so Screen 2 shows it and checkSDCard() remounts
+            printf("[UPLOAD] SD read failed at byte %ld of %ld\n", fileSize - (long)remaining, fileSize);
+            sdCardError = true;
+            break;
+          }
 
           // Robust retry loop for Wi-Fi buffer congestion
           size_t written = 0;
@@ -1513,7 +1553,11 @@ UploadResult streamFileToBackend(const char* filepath) {
               delay(50); // Yield to LwIP network stack to free TX buffers
             }
           }
-          if (written < bytesRead) break; // Hard disconnect after 1 full second of failure
+          if (written < bytesRead) {
+            // Hard disconnect after 1 full second of failure
+            printf("[UPLOAD] Wi-Fi write failed at byte %ld of %ld\n", fileSize - (long)remaining, fileSize);
+            break;
+          }
 
           remaining -= bytesRead;
           delay(2); // Keep watchdog alive
