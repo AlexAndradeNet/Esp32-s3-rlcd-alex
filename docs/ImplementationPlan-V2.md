@@ -353,6 +353,7 @@ Sizing: µ-law at 16 kHz is **16,000 bytes/s ≈ 57.6 MB per audio hour**. That 
 | 409 | `duplicate`, `recording_conflict` | Duplicate of a failed job; different file under an existing `recording_id` |
 | 411 | `length_required` | No `Content-Length` (in practice it fails at 401 first) |
 | 415 | `unsupported_media` | Content-Type is not `audio/wav` |
+| 499 | `incomplete_body` | The device closed the connection before sending `Content-Length` bytes (SD read or Wi-Fi write failure). Nothing is kept. 499 is nginx's "Client Closed Request"; the device rarely reads it, since it already hung up |
 | 500 | `internal` | Stream read error, or DB insert error (including the duplicate race) |
 
 Error body: `{error_code, message}`. `request_id` is not echoed.

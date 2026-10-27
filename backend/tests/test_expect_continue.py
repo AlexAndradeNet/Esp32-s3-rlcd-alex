@@ -67,6 +67,19 @@ class ExpectContinueTests(unittest.TestCase):
         finally:
             sock.close()
 
+    def test_body_cut_short_is_discarded(self):
+        body = support.mulaw_wav()
+        sock = self.open_upload(body, recording_id=support.new_recording_id())
+        try:
+            self.read_head(sock)
+            sock.sendall(body[:len(body) // 2])
+            sock.shutdown(socket.SHUT_WR)  # The device gives up mid-body, as on an SD read error
+            self.assertTrue(self.read_head(sock).startswith("HTTP/1.1 499"))
+        finally:
+            sock.close()
+        self.assertEqual(support.files_under(ingest_service.STAGING_DIR), [])
+        self.assertEqual(support.files_under(ingest_service.AUDIO_DIR), [])
+
     def test_duplicate_gets_its_answer_before_the_body_is_sent(self):
         body = support.mulaw_wav()
         recording_id = support.new_recording_id()

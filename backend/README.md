@@ -70,7 +70,7 @@ The tests need nothing beyond `requirements.txt`, and they don't touch your data
 | File | Covers |
 | ----- | ----- |
 | `test_ingest.py` | HMAC checks, clock skew, new uploads, recording IDs, duplicates and conflicts, digest mismatch, audio parked in `orphans/` when the DB insert fails |
-| `test_expect_continue.py` | A real Werkzeug server: `100 Continue` only after the header checks pass |
+| `test_expect_continue.py` | A real Werkzeug server: `100 Continue` only after the header checks pass, and a body cut short is discarded |
 | `test_recovery.py` | `recover_on_startup()` after a simulated crash |
 | `test_worker.py` | One worker pass, re-transcription using the current transcript, ASR failure |
 | `test_admin.py` | Audio playback (µ-law decoded to PCM, file untouched, 404/410), dashboard template |

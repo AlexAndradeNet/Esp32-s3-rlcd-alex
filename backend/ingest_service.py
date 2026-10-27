@@ -9,6 +9,7 @@ import threading
 from datetime import datetime, timezone
 from functools import wraps
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import ClientDisconnected
 from werkzeug.serving import WSGIRequestHandler
 from dotenv import load_dotenv
 from db import init_db, recover_on_startup, get_db_connection, get_current_transcript, STAGING_DIR, AUDIO_DIR, ORPHANS_DIR
@@ -166,6 +167,14 @@ def upload_audio():
                 f.write(chunk)
                 hasher.update(chunk)
                 audio_bytes += len(chunk)
+    except ClientDisconnected:
+        # The device closed the connection before sending Content-Length bytes: it stopped on an
+        # SD read error or a Wi-Fi write failure. Nothing is kept; the device retries the file later.
+        # 499 (Client Closed Request, as in nginx): the client ended the request, so it isn't a 400.
+        print(f"[UPLOAD ERROR] Device disconnected mid-body: received {audio_bytes} of {content_length} bytes")
+        if os.path.exists(staging_path):
+            os.remove(staging_path)
+        return jsonify({"error_code": "incomplete_body", "message": f"Received {audio_bytes} of {content_length} bytes"}), 499
     except Exception as e:
         print(f"[UPLOAD ERROR] Failed reading stream: {e}")
         if os.path.exists(staging_path):
