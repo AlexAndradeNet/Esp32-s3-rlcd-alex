@@ -148,6 +148,19 @@ uint8_t frame_buffer[AUDIO_FRAME_SIZE];
 bool isRecording = false;
 bool sdCardError = false; // Flagged if 0x107 or write failure occurs; cleared by checkSDCard() once the card answers again
 FILE *currentMeetingFile = NULL;
+// stdio buffer for the recording file: 16 KB = 32 sectors per SD write instead of one 512-byte write
+// command at a time. Internal DMA-capable RAM, so the SDMMC driver can send it as one multi-block write
+// (from PSRAM it would bounce through a 1-sector buffer, one command per sector again).
+// 16 KB, not more: a flush blocks the recording loop for ~14 ms at 10 MHz, and the I2S DMA only holds ~90 ms.
+#define RECORD_WRITE_BUFFER_SIZE (16 * 1024)
+char *recordWriteBuffer = NULL;
+// A brownout during an SD write is what corrupts the FAT (2026-10-27). Below these voltages no recording
+// starts, and a running one is closed cleanly and kept for a later upload (no Wi-Fi on a weak battery).
+#define BATTERY_MIN_START_V    3.55f
+#define BATTERY_MIN_RECORD_V   3.45f
+#define BATTERY_ABSENT_BELOW_V 2.5f  // No battery fitted (USB only): the ADC reads near 0, never block
+#define BATTERY_CHECK_MS       10000
+unsigned long lastBatteryCheck = 0;
 char currentMeetingFileName[128] = ""; // ~85 chars: /sdcard/meetings/ + timestamp + UUID + clock flag + status
 uint32_t totalRecordedBytes = 0;
 unsigned long recordingStartTime = 0;
@@ -641,6 +654,18 @@ void disableWiFi() {
 }
 
 // ================= BATTERY LOGIC =================
+// Battery voltage right now, also while recording. readBattery() skips the ADC while recording; this
+// one-shot read every BATTERY_CHECK_MS (ADC1, no radio, no I2C) does not touch the audio path.
+float readBatteryVoltageNow() {
+  int raw = analogRead(BAT_ADC_PIN);
+  return (raw / 4095.0f) * 3.3f * 3.0f * 1.079f;
+}
+
+bool batteryBelow(float minVolts) {
+  float v = readBatteryVoltageNow();
+  return v >= BATTERY_ABSENT_BELOW_V && v < minVolts;
+}
+
 void readBattery() {
   if (isRecording) return; // Keep the last value; no ADC sampling while recording
   int raw = analogRead(BAT_ADC_PIN);
@@ -1825,6 +1850,10 @@ void processFailedUploads() {
 }
 
 void startMeetingRecording() {
+  if (batteryBelow(BATTERY_MIN_START_V)) {
+    drawMeetingAssistantUI("Battery low: charge to record");
+    return;
+  }
   if (!checkSDCard()) {
     drawMeetingAssistantUI();
     return;
@@ -1851,6 +1880,15 @@ void startMeetingRecording() {
     return;
   }
 
+  if (!recordWriteBuffer) {
+    recordWriteBuffer = (char *)heap_caps_malloc(RECORD_WRITE_BUFFER_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  }
+  if (recordWriteBuffer) {
+    // Must be set before the first write. A power cut can lose up to ~1 s of audio still in this buffer;
+    // recoverPendingRecordings() repairs the rest of the file at the next boot.
+    setvbuf(currentMeetingFile, recordWriteBuffer, _IOFBF, RECORD_WRITE_BUFFER_SIZE);
+  }
+
   uint8_t dummyHeader[44] = {0};
   if (fwrite(dummyHeader, 1, 44, currentMeetingFile) < 44) {
     sdCardError = true;
@@ -1864,12 +1902,13 @@ void startMeetingRecording() {
 
   totalRecordedBytes = 0;
   recordingStartTime = millis();
+  lastBatteryCheck = millis();
   isRecording = true;
 
   drawMeetingAssistantUI();
 }
 
-void stopMeetingRecording() {
+void stopMeetingRecording(bool lowBattery = false) {
   isRecording = false;
 
   if (currentMeetingFile) {
@@ -1888,6 +1927,16 @@ void stopMeetingRecording() {
 
   if (sdCardError) {
     drawMeetingAssistantUI();
+    return;
+  }
+
+  if (lowBattery) {
+    // Wi-Fi transmit bursts are the largest current draw: keep the file for the next upload instead
+    String failedName = withRecordingStatus(String(currentMeetingFileName), "failed");
+    rename(currentMeetingFileName, failedName.c_str());
+    strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
+    currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
+    drawMeetingAssistantUI("Battery low: saved to SD");
     return;
   }
 
@@ -2320,8 +2369,15 @@ void loop() {
         }
       }
 
+      if (isRecording && millis() - lastBatteryCheck >= BATTERY_CHECK_MS) {
+        lastBatteryCheck = millis();
+        if (batteryBelow(BATTERY_MIN_RECORD_V)) {
+          stopMeetingRecording(true); // Close the file cleanly before the voltage gets low enough for a brownout
+        }
+      }
+
       // Update timer on screen once per second
-      if (millis() - lastTimerScreenUpdate >= 1000) {
+      if (isRecording && millis() - lastTimerScreenUpdate >= 1000) {
         lastTimerScreenUpdate = millis();
         drawMeetingAssistantUI();
       }
