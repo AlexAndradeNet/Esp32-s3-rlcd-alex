@@ -10,6 +10,9 @@ CustomSDPort::CustomSDPort(const char *SdName, int clk, int cmd, int d0, int wid
   mount_config_.allocation_unit_size = 16 * 1024 * 3;
 
   host_ = SDMMC_HOST_DEFAULT();
+  // 10 MHz instead of the 20 MHz default: more timing margin against rail noise from Wi-Fi bursts
+  // (0x107 timeouts). 1-bit at 10 MHz is ~1.2 MB/s, far above the 32 KB/s a recording needs.
+  host_.max_freq_khz = 10000;
 
   slot_config_ = SDMMC_SLOT_CONFIG_DEFAULT();
   slot_config_.width = width;
