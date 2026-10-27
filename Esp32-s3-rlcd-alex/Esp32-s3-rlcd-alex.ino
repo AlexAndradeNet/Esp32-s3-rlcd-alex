@@ -341,7 +341,29 @@ bool queryBigDataCloudCity() {
 }
 
 // ================= DATABASE PERSISTENCE =================
+// Lowers TX power to 8.5 dBm for one SD card access while the radio is on, then restores the power that
+// was set before. Full-power transmit bursts sag the 3.3 V rail and the card times out (0x107) or a
+// write gets cut. The same rule as enterUploadRadioMode(), for the accesses outside an upload batch:
+// the known-network check, the config saves after each sync, and the config reads. Does nothing while
+// Wi-Fi is off or already at low power.
+struct SdSafeRadio {
+  wifi_power_t saved = WIFI_POWER_19_5dBm;
+  bool lowered = false;
+  SdSafeRadio() {
+    if (WiFi.getMode() == WIFI_OFF) return;
+    saved = WiFi.getTxPower();
+    if (saved > WIFI_POWER_8_5dBm) {
+      WiFi.setTxPower(WIFI_POWER_8_5dBm);
+      lowered = true;
+    }
+  }
+  ~SdSafeRadio() {
+    if (lowered) WiFi.setTxPower(saved);
+  }
+};
+
 bool readWiFiDatabase(JsonDocument &doc) {
+  SdSafeRadio radioGuard; // Low TX power while this touches the SD card
   FILE *f = fopen("/sdcard/wifi_database.json", "r");
   if (!f) return false;
   fseek(f, 0, SEEK_END);
@@ -703,6 +725,7 @@ void pushCanvasToRLCD(bool invert = false) {
 
 // ================= SD CARD CONFIGS & RETENTION =================
 void loadSDClockConfig() {
+  SdSafeRadio radioGuard; // Low TX power while this touches the SD card
   memset(config_buffer, 0, sizeof(config_buffer));
   if (sdcardPort && sdcardPort->SDPort_ReadFile("/sdcard/config_clock.txt", (uint8_t *)config_buffer, NULL) == 0) {
     char *line = strtok(config_buffer, "\r\n");
@@ -772,6 +795,7 @@ void copyConfigValue(char *dest, size_t destSize, const char *val) {
 // Reads config_server.txt at boot and again before every upload, so a card that failed to mount at boot
 // or a file edited since still gives the right server. Keeps the current values if the file can't be read.
 bool loadServerConfig() {
+  SdSafeRadio radioGuard; // Low TX power while this touches the SD card
   FILE *f = fopen("/sdcard/config_server.txt", "r");
   if (!f) {
     printf("[CONFIG] config_server.txt not readable (%s), using %s\n", strerror(errno), mac_server);
@@ -943,6 +967,7 @@ void recoverPendingRecordings() {
 // A recording that failed to finish left a _pending file: repair it now instead of at the next boot.
 bool checkSDCard() {
   if (isRecording) return !sdCardError; // The recording file is open: never remount under it
+  SdSafeRadio radioGuard; // Low TX power while this touches the SD card
   bool hadError = sdCardError;
   sdCardError = true;
   if (sdcardPort && sdcardPort->SDPort_EnsureReady(hadError)) {
@@ -1434,6 +1459,20 @@ String serverHost() {
   return (colonIdx != -1) ? addr.substring(0, colonIdx) : addr;
 }
 
+// Disable power save to prevent dropped packets, but lower TX power to 8.5dBm to prevent 3.3V rail
+// brownouts and SD timeouts (0x107) during SD card access. Held for the whole upload batch: the
+// renames after each upload and the directory scan for _failed files touch the card too.
+void enterUploadRadioMode() {
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+}
+
+// Re-enable power save mode and restore maximum TX power once the batch is over
+void exitUploadRadioMode() {
+  WiFi.setSleep(true);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
 // Hashes the whole recording (a full SD read) and sets fileSize. After one read timeout (0x107) the card
 // stays stuck in its data state and every later read fails until it is re-initialized, so on failure
 // remount it and try once more. Safe here: no file is open while a recording is being uploaded.
@@ -1455,11 +1494,9 @@ String hashRecordingWithRetry(const char *filepath, long &fileSize) {
 UploadResult streamFileToBackend(const char* filepath) {
   if (WiFi.status() != WL_CONNECTED) return UPLOAD_RETRY_LATER;
 
-  // Disable power save to prevent dropped packets, but lower TX power
-  // to 8.5dBm to prevent 3.3V rail brownouts during SD card reads.
   // Applied before the SHA-256 pass: hashing is a full SD read of the recording too.
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  // The caller already entered this mode for the batch; repeating it here keeps this function safe on its own.
+  enterUploadRadioMode();
 
   // Read the whole file once before connecting: if the card can't, keep it as _failed for a later retry
   // instead of opening a request the device can't finish. Hashed before the body handle is opened,
@@ -1468,16 +1505,12 @@ UploadResult streamFileToBackend(const char* filepath) {
   String content_sha256 = hashRecordingWithRetry(filepath, fileSize);
   if (content_sha256.length() == 0) {
     sdCardError = true; // Screen 2 shows it; checkSDCard() remounts the card before the next recording
-    WiFi.setSleep(true);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     return UPLOAD_RETRY_LATER;
   }
 
   FILE *f = fopen(filepath, "rb");
   if (!f) {
     sdCardError = true;
-    WiFi.setSleep(true);
-    WiFi.setTxPower(WIFI_POWER_19_5dBm);
     return UPLOAD_RETRY_LATER;
   }
 
@@ -1611,11 +1644,8 @@ UploadResult streamFileToBackend(const char* filepath) {
     client.stop();
   }
   fclose(f);
-  
-  // Re-enable power save mode and restore maximum TX power
-  WiFi.setSleep(true); 
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  
+  // The radio stays in upload mode: the caller renames the file next (an SD write) and may continue
+  // with the _failed files. It calls exitUploadRadioMode() when the batch is over.
   return classifyUploadResponse(status, errorCode);
 }
 
@@ -1837,7 +1867,7 @@ void stopMeetingRecording() {
   }
 
   // Read while the radio is still off: picks up the address from the SD card even if it wasn't
-  // readable at boot. Never read the card with Wi-Fi up at full power (V2 §18.3).
+  // readable at boot. Never read the card with Wi-Fi up at full power (see enterUploadRadioMode()).
   loadServerConfig();
 
   // Re-establish connection during audio sync and disable after transmission concludes
@@ -1847,6 +1877,7 @@ void stopMeetingRecording() {
 
   String meetingPath = String(currentMeetingFileName);
   if (connected) {
+    enterUploadRadioMode(); // Low TX power for every SD access until the batch is over
     drawMeetingAssistantUI(("Syncing to " + serverHost() + "...").c_str());
     UploadResult result = uploadRecordingFile(meetingPath);
     strncpy(currentMeetingFileName, meetingPath.c_str(), sizeof(currentMeetingFileName) - 1);
@@ -1855,11 +1886,15 @@ void stopMeetingRecording() {
     if (result == UPLOAD_OK) {
       processFailedUploads();
     }
+    exitUploadRadioMode();
     disableWiFi(); // Immediately shut down Wi-Fi after transmission concludes
   } else {
     drawMeetingAssistantUI("Saved to SD (Offline)");
     String failedName = withRecordingStatus(meetingPath, "failed");
-    rename(meetingPath.c_str(), failedName.c_str());
+    {
+      SdSafeRadio radioGuard; // The failed connection attempt may have left the radio on
+      rename(meetingPath.c_str(), failedName.c_str());
+    }
     strncpy(currentMeetingFileName, failedName.c_str(), sizeof(currentMeetingFileName) - 1);
     currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
     disableWiFi(); // Power down Wi-Fi if connection attempt fails
