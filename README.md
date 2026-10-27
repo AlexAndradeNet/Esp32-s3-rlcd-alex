@@ -12,13 +12,13 @@ ESP32-S3 (record → SD card → signed HTTP upload)  ──Wi-Fi──▶  Mac 
 | ----- | ----- |
 | [`Esp32-s3-rlcd-alex/`](Esp32-s3-rlcd-alex/readme.md) | Arduino firmware: clock, calendar, weather, recorder, Wi-Fi setup portal |
 | [`backend/`](backend/README.md) | Python services: ingest (upload + processing worker) and admin (API + dashboard) |
-| `example_config_*.txt` | Templates for the config files that go on the device's SD card |
+| `conf/example_config_*.txt` | Templates for the config files that go on the device's SD card |
 | [`docs/`](docs/) | Implementation plans and lessons learned |
 
 ## Quick start
 
 1. **Backend:** set up the Mac Mini by following [`backend/README.md`](backend/README.md). Put a device ID and a shared secret in `backend/.env`.
-2. **SD card:** copy the `example_config_*.txt` files to the card's root as `config_wifi.txt`, `config_clock.txt`, and `config_server.txt`. Then edit them. In `config_server.txt`:
+2. **SD card:** copy the `conf/example_config_*.txt` files to the card's root as `config_wifi.txt`, `config_clock.txt`, and `config_server.txt`. Then edit them. In `config_server.txt`:
    * Set `device_id` and `hmac_secret` to the same values as `ESP32_UUID` and `ESP32_SECRET` in `backend/.env`.
    * Set `key_id=primary-key-01`.
    * Set `mac_server` to the Mini's LAN address, for example `http://192.168.1.100:8443`.

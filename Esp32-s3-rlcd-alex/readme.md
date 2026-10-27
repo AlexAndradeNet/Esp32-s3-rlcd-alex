@@ -33,7 +33,7 @@ arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=huge_a
 
 ## SD card setup
 
-The firmware reads its settings from the root of the SD card. That way you can change Wi-Fi, location, or server settings without reflashing. Start from the `example_config_*.txt` files at the repo root.
+The firmware reads its settings from the root of the SD card. That way you can change Wi-Fi, location, or server settings without reflashing. Start from the `conf/example_config_*.txt` files.
 
 | File | Keys |
 | ----- | ----- |

@@ -6,7 +6,8 @@
 ._*
 
 # Custom folder icons
-Icon
+Icon
+
 
 # Volume root files
 .DocumentRevisions-V100
@@ -120,6 +121,7 @@ playground.xcworkspace
 config_clock.txt
 config_wifi.txt
 config_server.txt
+wifi_database.json
 .env
 venv
 audio
