@@ -753,6 +753,57 @@ void saveSDClockConfig() {
   }
 }
 
+// Removes a UTF-8 BOM and surrounding spaces/tabs/line endings in place: some editors add them,
+// and "mac_server = http://..." or a BOM before the first key would otherwise not match.
+char *trimConfigToken(char *s) {
+  if ((uint8_t)s[0] == 0xEF && (uint8_t)s[1] == 0xBB && (uint8_t)s[2] == 0xBF) s += 3;
+  while (*s == ' ' || *s == '\t') s++;
+  char *end = s + strlen(s);
+  while (end > s && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) end--;
+  *end = '\0';
+  return s;
+}
+
+void copyConfigValue(char *dest, size_t destSize, const char *val) {
+  strncpy(dest, val, destSize - 1);
+  dest[destSize - 1] = '\0';
+}
+
+// Reads config_server.txt at boot and again before every upload, so a card that failed to mount at boot
+// or a file edited since still gives the right server. Keeps the current values if the file can't be read.
+bool loadServerConfig() {
+  FILE *f = fopen("/sdcard/config_server.txt", "r");
+  if (!f) {
+    printf("[CONFIG] config_server.txt not readable (%s), using %s\n", strerror(errno), mac_server);
+    return false;
+  }
+  char line[192];
+  bool serverFound = false;
+  while (fgets(line, sizeof(line), f)) {
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = '\0';
+    char *key = trimConfigToken(line);
+    char *val = trimConfigToken(eq + 1);
+    // Key names and value lengths only: the file also holds hmac_secret
+    printf("[CONFIG] key '%s' (%u chars)\n", key, (unsigned)strlen(val));
+    if (strlen(val) == 0) continue;
+    if (strcmp(key, "mac_server") == 0) {
+      copyConfigValue(mac_server, sizeof(mac_server), val);
+      serverFound = true;
+    } else if (strcmp(key, "device_id") == 0) {
+      copyConfigValue(device_id, sizeof(device_id), val);
+    } else if (strcmp(key, "key_id") == 0) {
+      copyConfigValue(key_id, sizeof(key_id), val);
+    } else if (strcmp(key, "hmac_secret") == 0) {
+      copyConfigValue(hmac_secret, sizeof(hmac_secret), val);
+    }
+  }
+  fclose(f);
+  printf("[CONFIG] Server: %s%s\n", mac_server, serverFound ? "" : " (mac_server not found in the file: default)");
+  return true;
+}
+
 void loadSDConfigs() {
   sdcardPort = new CustomSDPort("/sdcard");
   
@@ -781,42 +832,7 @@ void loadSDConfigs() {
     }
   }
 
-  memset(config_buffer, 0, sizeof(config_buffer));
-  if (sdcardPort->SDPort_ReadFile("/sdcard/config_server.txt", (uint8_t *)config_buffer, NULL) == 0) {
-    char *line = strtok(config_buffer, "\r\n");
-    while (line != NULL) {
-      char *eq = strchr(line, '=');
-      if (eq) {
-        *eq = '\0';
-        char *key = line;
-        char *val = eq + 1;
-        // Fix typo handler from client SD
-        if (strcmp(key, "mac_server") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(mac_server, val, sizeof(mac_server) - 1);
-            mac_server[sizeof(mac_server) - 1] = '\0';
-          }
-        } else if (strcmp(key, "device_id") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(device_id, val, sizeof(device_id) - 1);
-            device_id[sizeof(device_id) - 1] = '\0';
-          }
-        } else if (strcmp(key, "key_id") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(key_id, val, sizeof(key_id) - 1);
-            key_id[sizeof(key_id) - 1] = '\0';
-          }
-        } else if (strcmp(key, "hmac_secret") == 0) {
-          if (val && strlen(val) > 0) {
-            strncpy(hmac_secret, val, sizeof(hmac_secret) - 1);
-            hmac_secret[sizeof(hmac_secret) - 1] = '\0';
-          }
-        }
-      }
-      line = strtok(NULL, "\r\n");
-    }
-  }
-
+  loadServerConfig();
   loadSDClockConfig();
 }
 
@@ -1401,6 +1417,23 @@ UploadResult classifyUploadResponse(int status, const String &errorCode) {
   return UPLOAD_REJECTED;
 }
 
+// mac_server without the scheme or any path: "host" or "host:port"
+String serverAddress() {
+  String addr = String(mac_server);
+  addr.replace("http://", "");
+  addr.replace("https://", "");
+  int slashIdx = addr.indexOf('/');
+  if (slashIdx != -1) addr = addr.substring(0, slashIdx);
+  return addr;
+}
+
+// The host part only (IP or name), also shown on Screen 2 while syncing
+String serverHost() {
+  String addr = serverAddress();
+  int colonIdx = addr.indexOf(':');
+  return (colonIdx != -1) ? addr.substring(0, colonIdx) : addr;
+}
+
 // Hashes the whole recording (a full SD read) and sets fileSize. After one read timeout (0x107) the card
 // stays stuck in its data state and every later read fails until it is re-initialized, so on failure
 // remount it and try once more. Safe here: no file is open while a recording is being uploaded.
@@ -1448,11 +1481,9 @@ UploadResult streamFileToBackend(const char* filepath) {
     return UPLOAD_RETRY_LATER;
   }
 
-  String serverStr = String(mac_server);
-  serverStr.replace("http://", "");
-  serverStr.replace("https://", "");
+  String host = serverHost();
+  String serverStr = serverAddress();
   int colonIdx = serverStr.indexOf(':');
-  String host = (colonIdx != -1) ? serverStr.substring(0, colonIdx) : serverStr;
   int port = (colonIdx != -1) ? serverStr.substring(colonIdx + 1).toInt() : 8443;
   String request_id = generateUUIDv4();
   unsigned long request_timestamp = time(NULL);
@@ -1805,6 +1836,10 @@ void stopMeetingRecording() {
     return;
   }
 
+  // Read while the radio is still off: picks up the address from the SD card even if it wasn't
+  // readable at boot. Never read the card with Wi-Fi up at full power (V2 §18.3).
+  loadServerConfig();
+
   // Re-establish connection during audio sync and disable after transmission concludes
   drawMeetingAssistantUI("Connecting Wi-Fi...");
   setLowPowerClock(false); // Boost CPU for high-speed transmission
@@ -1812,7 +1847,7 @@ void stopMeetingRecording() {
 
   String meetingPath = String(currentMeetingFileName);
   if (connected) {
-    drawMeetingAssistantUI("Syncing to Mac...");
+    drawMeetingAssistantUI(("Syncing to " + serverHost() + "...").c_str());
     UploadResult result = uploadRecordingFile(meetingPath);
     strncpy(currentMeetingFileName, meetingPath.c_str(), sizeof(currentMeetingFileName) - 1);
     currentMeetingFileName[sizeof(currentMeetingFileName) - 1] = '\0';
