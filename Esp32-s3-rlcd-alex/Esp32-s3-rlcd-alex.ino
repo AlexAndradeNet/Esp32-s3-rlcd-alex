@@ -144,7 +144,7 @@ enum UploadResult {
 // ---------- AUDIO RECORDING STATE & SD WATCHDOG ----------
 uint8_t frame_buffer[AUDIO_FRAME_SIZE];
 bool isRecording = false;
-bool sdCardError = false; // Flagged if 0x107 or write failure occurs
+bool sdCardError = false; // Flagged if 0x107 or write failure occurs; cleared by checkSDCard() once the card answers again
 FILE *currentMeetingFile = NULL;
 char currentMeetingFileName[128] = ""; // ~85 chars: /sdcard/meetings/ + timestamp + UUID + clock flag + status
 uint32_t totalRecordedBytes = 0;
@@ -911,6 +911,25 @@ void recoverPendingRecordings() {
   }
 }
 
+// An SD error can be flagged hours earlier by a background config save on Screen 1. Before Screen 2
+// is shown or a recording starts, probe the card, remount it if needed, and clear the flag if it works.
+// After an error the card is always remounted: it can answer status probes while FATFS still fails.
+// A recording that failed to finish left a _pending file: repair it now instead of at the next boot.
+bool checkSDCard() {
+  if (isRecording) return !sdCardError; // The recording file is open: never remount under it
+  bool hadError = sdCardError;
+  sdCardError = true;
+  if (sdcardPort && sdcardPort->SDPort_EnsureReady(hadError)) {
+    DIR *dir = opendir("/sdcard/meetings");
+    if (dir) {
+      closedir(dir);
+      sdCardError = false;
+      if (hadError) recoverPendingRecordings();
+    }
+  }
+  return !sdCardError;
+}
+
 // ================= LOCALIZATION STRATEGY =================
 void applyLocalizationStrategy() {
   // Offline Mode (No Internet): Mandatory read from local file data, ignoring override flag entirely
@@ -1589,7 +1608,7 @@ void drawMeetingAssistantUI(const char* extraStatus = NULL) {
     canvas.print("timed out during operation.");
     
     canvas.setCursor(35, 230);
-    canvas.print("Please restart the device.");
+    canvas.print("Re-open this screen to retry.");
     
     canvas.setTextColor(1);
     pushCanvasToRLCD(false);
@@ -1676,7 +1695,10 @@ void processFailedUploads() {
 }
 
 void startMeetingRecording() {
-  if (sdCardError) return;
+  if (!checkSDCard()) {
+    drawMeetingAssistantUI();
+    return;
+  }
 
   // The identity is part of the name from the moment the file exists, so every retry
   // (even after a reboot) sends the same recording_id
@@ -1687,6 +1709,12 @@ void startMeetingRecording() {
            generateUUIDv4().c_str(), clockSyncedSinceBoot ? 1 : 0);
 
   currentMeetingFile = fopen(currentMeetingFileName, "wb");
+  if (!currentMeetingFile) {
+    // E.g. the card stopped answering during the last upload but no error was flagged: remount once and retry
+    if (sdcardPort && sdcardPort->SDPort_EnsureReady(true)) {
+      currentMeetingFile = fopen(currentMeetingFileName, "wb");
+    }
+  }
   if (!currentMeetingFile) {
     sdCardError = true;
     drawMeetingAssistantUI();
@@ -1990,10 +2018,12 @@ void enterClockLightSleep() {
   if (sec < 0 || sec > 59) sec = 0;
   uint64_t sleepUs = (uint64_t)(60 - sec) * 1000000ULL + 200000ULL; // Wake 200ms after the minute changes
 
-  // Keep display, I2C, amplifier and button pins in their active configuration during sleep
+  // Keep display, I2C, amplifier, button and SD card (CLK 38, CMD 21, D0 39) pins in their active
+  // configuration during sleep. Without the SD pins, CMD/D0 lose their pull-ups and CLK floats
+  // every minute, and after enough wakeups the card stops answering (0x107 timeouts).
   const gpio_num_t keepPins[] = {GPIO_NUM_12, GPIO_NUM_11, GPIO_NUM_5, GPIO_NUM_40, GPIO_NUM_41,
                                  (gpio_num_t)I2C_SDA, (gpio_num_t)I2C_SCL, (gpio_num_t)PA_CTRL,
-                                 (gpio_num_t)BUTTON_PIN};
+                                 (gpio_num_t)BUTTON_PIN, GPIO_NUM_38, GPIO_NUM_21, GPIO_NUM_39};
   for (gpio_num_t pin : keepPins) {
     gpio_sleep_sel_dis(pin);
   }
@@ -2096,6 +2126,7 @@ void loop() {
       // Check whether a connection can be established and turn off Wi-Fi
       ensureWiFiConnected(6); // Tests connection, sets lastNetworkAvailable & lastKnownIP
       disableWiFi();          // Powers down Wi-Fi to keep audio pristine & save power
+      checkSDCard();          // Clears a stale SD error (remounting the card if needed) before it is shown
       drawMeetingAssistantUI();
     }
   }

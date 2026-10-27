@@ -4,20 +4,24 @@
 
 CustomSDPort::CustomSDPort(const char *SdName, int clk, int cmd, int d0, int width)
   : SdName_(SdName) {
-  esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
-  mount_config.format_if_mount_failed = false;
-  mount_config.max_files = 5;
-  mount_config.allocation_unit_size = 16 * 1024 * 3;
+  mount_config_ = {};
+  mount_config_.format_if_mount_failed = false;
+  mount_config_.max_files = 5;
+  mount_config_.allocation_unit_size = 16 * 1024 * 3;
 
-  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+  host_ = SDMMC_HOST_DEFAULT();
 
-  sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-  slot_config.width = width;
-  slot_config.clk = (gpio_num_t)clk;
-  slot_config.cmd = (gpio_num_t)cmd;
-  slot_config.d0 = (gpio_num_t)d0;
+  slot_config_ = SDMMC_SLOT_CONFIG_DEFAULT();
+  slot_config_.width = width;
+  slot_config_.clk = (gpio_num_t)clk;
+  slot_config_.cmd = (gpio_num_t)cmd;
+  slot_config_.d0 = (gpio_num_t)d0;
 
-  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_vfs_fat_sdmmc_mount(SdName_, &host, &slot_config, &mount_config, &sdcard_host));
+  Mount();
+}
+
+bool CustomSDPort::Mount() {
+  ESP_ERROR_CHECK_WITHOUT_ABORT(esp_vfs_fat_sdmmc_mount(SdName_, &host_, &slot_config_, &mount_config_, &sdcard_host));
 
   if (sdcard_host != NULL) {
     sdmmc_card_print_info(stdout, sdcard_host);
@@ -25,6 +29,20 @@ CustomSDPort::CustomSDPort(const char *SdName, int clk, int cmd, int d0, int wid
   } else {
     is_SdcardInitOK = 0;
   }
+  return is_SdcardInitOK;
+}
+
+// FATFS keeps failing once the card has stopped answering (0x107 timeouts), until the card is
+// initialized again. Unmounting also de-initializes the SDMMC host, so Mount() starts from scratch.
+bool CustomSDPort::SDPort_EnsureReady(bool forceRemount) {
+  if (!forceRemount && sdcard_host != NULL && sdmmc_get_status(sdcard_host) == ESP_OK) return true;
+
+  ESP_LOGW(TAG, "%s", forceRemount ? "Remounting SD card after an error" : "SD card not responding, remounting");
+  if (sdcard_host != NULL) {
+    esp_vfs_fat_sdcard_unmount(SdName_, sdcard_host);
+    sdcard_host = NULL;
+  }
+  return Mount();
 }
 
 CustomSDPort::~CustomSDPort() {
